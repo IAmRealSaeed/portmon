@@ -36,7 +36,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "2.0"
+VERSION = "2.1"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -448,7 +448,8 @@ def report(day_from, day_to, group=None):
     return {"from": day_from, "to": day_to, "scope": group or "all", "groups": out_groups, "ports": list(port_rows.values()),
             "ungrouped": ungrouped, "days": days, "total": {"rx": tot_rx, "tx": tot_tx},
             "live": {"rx_bps": sum(live.get(p, {}).get("rx_bps", 0) for p in in_scope),
-                     "tx_bps": sum(live.get(p, {}).get("tx_bps", 0) for p in in_scope), "interval": LIVE["interval"]}}
+                     "tx_bps": sum(live.get(p, {}).get("tx_bps", 0) for p in in_scope), "interval": LIVE["interval"],
+                     "ts": LIVE["ts"]}}
 
 
 def series_point(key, per_port, in_scope, groups, ports):
@@ -719,129 +720,225 @@ def main():
 
 
 # ------------------------------------------------------------------ pages
-FONT_CSS = """@font-face{font-family:Vazirmatn;src:url(/font/Vazirmatn-Regular.woff2) format('woff2');font-weight:400;font-display:swap}
-@font-face{font-family:Vazirmatn;src:url(/font/Vazirmatn-Bold.woff2) format('woff2');font-weight:700;font-display:swap}"""
+# Graphite surfaces and three text roles; colour belongs to the data (each group's own, download and upload)
+# and to one signature: the link light beside a live rate, which blinks once per new sample and goes grey when
+# the collector has stopped.
+FONT_CSS = r"""@font-face{font-family:Vazirmatn;src:url(/font/Vazirmatn-Regular.woff2) format('woff2');font-weight:400;font-display:swap}
+@font-face{font-family:Vazirmatn;src:url(/font/Vazirmatn-Medium.woff2) format('woff2');font-weight:500;font-display:swap}"""
 
-THEME_CSS = """:root{--bg:#0f1218;--card:#171b23;--card2:#1d222c;--line:#262c38;--text:#e6e9ef;--muted:#8b93a3;--acc:#4f8cff;--up:#f5a524;--down:#3ccf91;--bad:#ff6b6b}
-@media (prefers-color-scheme: light){:root{--bg:#f3f5f9;--card:#fff;--card2:#f7f8fb;--line:#dfe3ea;--text:#141821;--muted:#5d6676}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Vazirmatn,Tahoma,sans-serif;font-size:15px}"""
+THEME_CSS = r""":root{color-scheme:dark;--bg0:#0f0f10;--bg:#141415;--card:#19191b;--raised:#232325;--hover:rgba(237,237,237,.04);
+--line:rgba(237,237,237,.08);--line2:rgba(237,237,237,.14);--t1:#ededed;--t2:#a1a1a6;--t3:#85858b;--sel:#ededed;--onsel:#141415;
+--c1:#6ea8fe;--dn:#4cc38a;--upc:#d9a24a;--live:#4cc38a;--warn:#d9a24a;--bad:#e5484d;--shadow:0 8px 24px rgba(0,0,0,.4);
+--ease:cubic-bezier(.22,1,.36,1)}
+@media (prefers-color-scheme: light){:root{color-scheme:light;--bg0:#f4f4f5;--bg:#fafafa;--card:#fff;--raised:#f4f4f5;--hover:rgba(23,23,23,.03);
+--line:rgba(23,23,23,.08);--line2:rgba(23,23,23,.16);--t1:#171717;--t2:#525252;--t3:#737373;--sel:#171717;--onsel:#fff;
+--c1:#2f6fd6;--dn:#16936a;--upc:#b7791f;--live:#16a34a;--warn:#b7791f;--bad:#dc2626;--shadow:0 8px 24px rgba(0,0,0,.08)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--t1);font:400 14px/1.6 Vazirmatn,Tahoma,sans-serif}
+b,strong,h1,h2{font-weight:500}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--t1);outline-offset:2px}
+.btn{height:36px;padding:0 16px;border-radius:8px;border:1px solid var(--line2);background:var(--raised);color:var(--t1);cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap;
+  transition:background-color .15s var(--ease),border-color .15s var(--ease),transform .15s var(--ease)}
+.btn:hover{border-color:var(--t3)}.btn:active{transform:scale(.98)}
+.btn.pri{background:var(--sel);border-color:var(--sel);color:var(--onsel)}.btn.pri:hover{opacity:.9}
+.btn.del{background:none;border-color:transparent;color:var(--bad)}.btn.del:hover{background:var(--hover)}
+.btn.sm{height:28px;padding:0 10px;font-size:13px}
+input,select,textarea{height:36px;padding:0 12px;border-radius:8px;border:1px solid var(--line2);background:var(--raised);
+  transition:border-color .15s var(--ease)}
+input:hover,textarea:hover{border-color:var(--t3)}
+textarea{height:auto;padding:8px 12px;line-height:1.6}"""
 
-LOGIN_HTML = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{TITLE}} — ورود</title><style>""" + FONT_CSS + THEME_CSS + """
-body{min-height:100vh;display:grid;place-items:center}
-form{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px;width:min(340px,92vw);display:grid;gap:14px}
-h1{margin:0;font-size:18px}input{font:inherit;padding:11px 12px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
-button{font:inherit;font-weight:700;padding:11px;border:0;border-radius:9px;background:var(--acc);color:#fff;cursor:pointer}.err{color:var(--bad);font-size:14px;min-height:1em}
-</style></head><body><form method="post" action="/login"><h1>{{TITLE}}</h1><input type="password" name="password" placeholder="رمز ورود" autofocus required>
-<div class="err"><!--ERR--></div><button>ورود</button></form></body></html>"""
+LOGIN_HTML = r"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{TITLE}} — ورود</title><style>""" + FONT_CSS + THEME_CSS + r"""
+body{min-height:100vh;display:grid;place-items:center;padding:16px}
+form{width:min(360px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px 24px 24px;display:grid;gap:8px}
+h1{margin:0 0 16px;font-size:18px;line-height:1.3}label{font-size:13px;color:var(--t2)}input{height:40px}
+.err{color:var(--bad);font-size:13px;min-height:20px}.btn{height:40px}
+</style></head><body><form method="post" action="/login"><h1>{{TITLE}}</h1><label for="pw">رمز ورود</label>
+<input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
+<div class="err" role="alert"><!--ERR--></div><button class="btn pri">ورود</button></form></body></html>"""
 
-APP_HTML = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{TITLE}}</title><style>""" + FONT_CSS + THEME_CSS + """
-header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5}
-header h1{font-size:17px;margin:0}header .host{color:var(--muted);font-size:12px}a{color:var(--acc)}
-main{max-width:1180px;margin:0 auto;padding:16px;display:grid;gap:16px}
-.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.chip{font:inherit;padding:6px 13px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
-.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
-.gchip{border-width:2px}.gchip.on{color:#fff}
-input,select,textarea{font:inherit;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text)}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;position:relative;overflow:hidden}
-.card .k{color:var(--muted);font-size:13px}.card .v{font-size:21px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}.card .s{color:var(--muted);font-size:12px;margin-top:4px}
-.v.up{color:var(--up)}.v.down{color:var(--down)}
-.meter{height:6px;border-radius:3px;background:var(--line);margin-top:10px;overflow:hidden}.meter i{display:block;height:100%;border-radius:3px}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.panel h2{font-size:15px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
-.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-th,td{padding:9px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--muted);font-weight:400;font-size:13px}
-tr.g{cursor:pointer}tr.g td{font-weight:700}tr.g td:first-child{border-right:5px solid var(--gc)}
-tr.p td:first-child{padding-right:26px;border-right:5px solid var(--gc)}tr.p td{font-weight:400}
-tr.tot td{font-weight:700;background:var(--card2)}
-.desc{color:var(--muted);font-size:13px;white-space:normal;max-width:340px;display:inline-block;vertical-align:middle;cursor:pointer;border-bottom:1px dashed transparent}
-.desc:hover{border-bottom-color:var(--muted)}.desc.empty{opacity:.55}
-.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:6px;vertical-align:middle;flex:none}
-.mini{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:3px;vertical-align:middle}
-.share{display:inline-block;height:6px;border-radius:3px;vertical-align:middle;margin-left:6px}
-.chart{padding:10px 8px 4px}.chart svg{width:100%;height:240px;display:block}.legend{display:flex;flex-wrap:wrap;gap:12px;padding:0 14px 12px;font-size:13px;color:var(--muted)}
-.tip{position:fixed;pointer-events:none;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;display:none;z-index:9;box-shadow:0 6px 24px #0006;line-height:1.7}
-.hide{display:none!important}.muted{color:var(--muted)}
-.mgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line)}
-.btn{font:inherit;padding:6px 11px;border-radius:8px;border:1px solid var(--line);background:var(--card2);color:var(--text);cursor:pointer}
-.btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}.btn.del{color:var(--bad)}
-.gsel{display:flex;flex-wrap:wrap;gap:6px}.gsel label{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);cursor:pointer;font-size:13px}
-.gsel input{margin:0}.gsel label.on{border-color:var(--gc);background:color-mix(in srgb,var(--gc) 18%,transparent)}
-.prow{display:grid;grid-template-columns:70px 1fr auto;gap:8px;align-items:start;padding:10px 14px;border-bottom:1px solid var(--line)}
-.prow textarea{width:100%;min-height:38px;resize:vertical}
-.toast{position:fixed;bottom:16px;left:16px;background:var(--card);border:1px solid var(--line);padding:10px 14px;border-radius:10px;display:none;z-index:10}
-@media (max-width:640px){.card .v{font-size:17px}th,td{padding:8px}.mgrid{grid-template-columns:1fr}.prow{grid-template-columns:60px 1fr}}
+APP_HTML = r"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{TITLE}}</title><style>""" + FONT_CSS + THEME_CSS + r"""
+.top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:32px;height:56px;padding:0 24px;background:var(--bg0);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:baseline;gap:12px;min-width:0}.brand b{font-size:16px;white-space:nowrap}
+.brand span{font-size:12px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tabs{display:flex;gap:24px;height:100%}
+.tabs button{height:100%;padding:0;border:0;border-bottom:2px solid transparent;background:none;color:var(--t2);cursor:pointer;
+  transition:color .15s var(--ease),border-color .15s var(--ease)}
+.tabs button:hover{color:var(--t1)}.tabs button.on{color:var(--t1);border-bottom-color:var(--t1)}
+.out{margin-inline-start:auto;font-size:13px;color:var(--t2);text-decoration:none}.out:hover{color:var(--t1)}
+main{max-width:1440px;margin:0 auto;padding:24px;display:grid;grid-template-columns:minmax(0,1fr);gap:24px}
+section{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;min-width:0}
+.tools{display:flex;flex-wrap:wrap;align-items:center;gap:12px 16px}
+.seg{display:inline-flex;gap:2px;padding:2px;border-radius:10px;background:var(--raised);max-width:100%;overflow-x:auto}
+.seg button{height:28px;padding:0 12px;border:0;border-radius:8px;background:none;color:var(--t2);cursor:pointer;white-space:nowrap;
+  transition:background-color .15s var(--ease),color .15s var(--ease)}
+.seg button:hover{color:var(--t1)}.seg button.on{background:var(--sel);color:var(--onsel)}
+.custom{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--t3);font-size:13px}.custom input{height:32px;padding:0 8px;min-width:0;flex:1 1 128px}.custom .btn{height:32px}
+.scopes{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.scopes>span{font-size:13px;color:var(--t3);margin-inline-end:4px}
+.chip{height:32px;padding:0 12px;border-radius:8px;border:1px solid var(--line);background:none;color:var(--t2);cursor:pointer;
+  display:inline-flex;align-items:center;gap:8px;transition:background-color .15s var(--ease),color .15s var(--ease),border-color .15s var(--ease)}
+.chip:hover{color:var(--t1);background:var(--hover)}.chip.on{background:var(--raised);border-color:var(--line2);color:var(--t1)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.q{display:inline-flex;align-items:baseline;gap:4px;white-space:nowrap}.q small{font-size:12px;color:var(--t3)}
+.kpis,.cards{display:grid;gap:12px}.kpis{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.4fr)}.cards{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 20px;min-width:0}
+.kpi .k{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
+.kpi .v{display:flex;align-items:baseline;gap:8px;margin-top:8px;font-size:28px;line-height:1.2;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
+.kpi.main .v{font-size:32px}.kpi .v .q small{font-size:14px}.kpi .v .ic{align-self:center;color:var(--t3)}
+.kpi .s{margin-top:4px;font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums}.kpi .s .ic{vertical-align:-2px}
+.meter{height:4px;border-radius:2px;background:var(--raised);margin-top:12px;overflow:hidden}
+.meter i{display:block;height:100%;border-radius:2px;background:var(--t3)}.kpi.warn .meter i{background:var(--warn)}.kpi.bad .meter i{background:var(--bad)}
+.led{width:8px;height:8px;border-radius:50%;background:var(--t3);opacity:.5;flex:none}.led.on{background:var(--live);opacity:1}
+.led.blink{animation:blink .9s var(--ease) 1}@keyframes blink{30%{opacity:.15}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;min-width:0}
+.ph{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;padding:16px 20px}
+.ph h2{margin:0;font-size:15px;line-height:1.4}.ph>div:first-child{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}
+.sub,.cap{font-size:12px;color:var(--t3)}.cap{margin:0;padding:0 20px 12px;line-height:1.7}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12px;color:var(--t2)}.legend span{display:inline-flex;align-items:center;gap:8px}
+.chart{padding:0 12px 12px}.chart svg{display:block;width:100%;direction:ltr}
+.plot text{font:11px Vazirmatn,Tahoma,sans-serif;fill:var(--t3)}
+.empty{padding:24px 20px;color:var(--t3);font-size:13px}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{height:36px;padding:0 16px;font-size:12px;font-weight:400;color:var(--t3);text-align:right;border-top:1px solid var(--line);border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:12px 16px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:middle}
+tbody tr:last-child td{border-bottom:0}
+tr.g{cursor:pointer}tr.g td{font-weight:500;transition:background-color .15s var(--ease)}tr.g:hover td{background:var(--hover)}
+tr.g .ic{color:var(--t3);vertical-align:-3px;margin-inline-end:4px;transition:transform .2s var(--ease)}tr.g.open .ic{transform:rotate(-90deg)}
+.gn{display:inline-flex;align-items:center;gap:8px}.cnt{font-size:12px;font-weight:400;color:var(--t3)}
+tr.p td:first-child{padding-inline-start:52px}.pp{display:inline-flex;align-items:center;gap:8px}.pp .dot{width:6px;height:6px}
+.desc{display:flex;align-items:center;gap:4px;max-width:360px;margin-top:2px;font-size:12px;color:var(--t3);white-space:normal;cursor:pointer}
+.desc .ic{opacity:0;transition:opacity .15s var(--ease)}.desc:hover{color:var(--t2)}.desc:hover .ic{opacity:1}.desc.empty{color:var(--t3);opacity:.7}
+tr.tot td{font-weight:500;background:var(--raised);border-bottom:0}
+.share{display:inline-flex;align-items:center;gap:8px}.bar{width:56px;height:4px;border-radius:2px;background:var(--raised);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:2px}
+.dim{color:var(--t2)}
+.tip{position:fixed;z-index:9;display:none;min-width:180px;padding:12px;border-radius:10px;border:1px solid var(--line2);background:var(--raised);
+  box-shadow:var(--shadow);font-size:13px;line-height:20px;pointer-events:none;font-variant-numeric:tabular-nums}
+.tip b{display:block;margin-bottom:4px}.tip .r{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.tip .r span:first-child{display:inline-flex;align-items:center;gap:8px;color:var(--t2)}.tip .hd{margin-top:8px;color:var(--t3);font-size:12px}
+.hide{display:none!important}
+.sgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:16px}.sgrid .w4{grid-column:span 4}.sgrid .w2{grid-column:span 2}.sgrid .w3{grid-column:span 3}
+td .pid{font-size:12px;color:var(--t3);margin-inline-start:8px;unicode-bidi:isolate}.nw{white-space:nowrap}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px;align-items:start}
+.form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;padding:0 20px 16px}.form.col{flex-direction:column;align-items:stretch;gap:8px}
+.field{display:grid;gap:4px}.field.grow{flex:1;min-width:180px}.field label,.lab{font-size:13px;color:var(--t2)}
+input[type=color]{width:36px;padding:2px;cursor:pointer}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:12px 20px;border-top:1px solid var(--line)}
+.row .grow{flex:1;min-width:140px}.row .num{min-width:56px;font-variant-numeric:tabular-nums}.row .meta{font-size:13px;color:var(--t3)}
+.gsel{display:flex;flex-wrap:wrap;gap:8px}
+.gsel label{height:28px;padding:0 10px;border-radius:6px;border:1px solid var(--line);display:inline-flex;align-items:center;gap:8px;
+  font-size:13px;color:var(--t2);cursor:pointer;transition:background-color .15s var(--ease),color .15s var(--ease)}
+.gsel label.on{background:var(--raised);border-color:var(--line2);color:var(--t1)}.gsel input{width:14px;height:14px;margin:0;accent-color:var(--t1)}
+.prow{display:grid;grid-template-columns:64px 1fr auto;gap:12px;align-items:start;padding:16px 20px;border-top:1px solid var(--line)}
+.prow .num{padding-top:8px;font-weight:500}.prow textarea{width:100%;min-height:36px;resize:vertical}.prow>div{display:grid;gap:8px}
+.toast{position:fixed;bottom:24px;left:24px;z-index:10;padding:12px 16px;border-radius:10px;border:1px solid var(--line2);background:var(--raised);
+  box-shadow:var(--shadow);font-size:13px;opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .2s var(--ease),transform .2s var(--ease)}
+.toast.show{opacity:1;transform:none}
+@media (max-width:900px){.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.kpi.main{grid-column:span 2}.sgrid .w4,.sgrid .w2,.sgrid .w3{grid-column:1/-1}.mgrid{grid-template-columns:1fr}}
+@media (max-width:640px){.top{flex-wrap:wrap;height:auto;gap:0 16px;padding:12px 16px 0}.brand{flex:1}.tabs{order:3;width:100%;height:44px;margin-top:8px;overflow-x:auto}
+  main{padding:16px;gap:16px}.kpi{padding:12px 16px}.kpi .v{font-size:22px}.kpi.main .v{font-size:26px}.ph{padding:12px 16px}
+  th{padding:0 10px}td{padding:10px}tr.p td:first-child{padding-inline-start:36px}.prow{grid-template-columns:48px 1fr;padding:12px 16px}
+  .prow .btn{grid-column:2;justify-self:start}.form{padding:0 16px 16px}.row{padding:12px 16px}.cap{padding:0 16px 12px}.toast{left:16px;right:16px;bottom:16px}}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
 </style></head><body>
-<header><div><h1>{{TITLE}}</h1><div class="host" id="host"></div></div>
-<div class="bar"><button class="chip on" data-tab="rep">مصرف پورت‌ها</button><button class="chip" data-tab="sys">منابع سرور</button><button class="chip" data-tab="mgr">تنظیمات</button><a class="chip" href="/logout">خروج</a></div></header>
+<header class="top"><div class="brand"><b>{{TITLE}}</b><span id="host"></span></div>
+<nav class="tabs" aria-label="بخش‌ها"><button class="on" data-tab="rep">مصرف پورت‌ها</button><button data-tab="sys">منابع سرور</button><button data-tab="mgr">تنظیمات</button></nav>
+<a class="out" href="/logout">خروج</a></header>
 <main>
 <section id="rep">
- <div class="bar" id="ranges">
-  <button class="chip" data-r="today">امروز</button><button class="chip" data-r="yesterday">دیروز</button>
-  <button class="chip on" data-r="7">۷ روز</button><button class="chip" data-r="30">۳۰ روز</button><button class="chip" data-r="90">۹۰ روز</button>
-  <span class="muted">از</span><input type="date" id="from"><span class="muted">تا</span><input type="date" id="to"><button class="chip" id="apply">نمایش</button>
+ <div class="tools">
+  <div class="seg" id="ranges" aria-label="بازه"><button data-r="today">امروز</button><button data-r="yesterday">دیروز</button><button class="on" data-r="7">۷ روز</button><button data-r="30">۳۰ روز</button><button data-r="90">۹۰ روز</button></div>
+  <div class="custom"><label for="from">از</label><input type="date" id="from"><label for="to">تا</label><input type="date" id="to"><button class="btn" id="apply">نمایش</button></div>
  </div>
- <div class="bar" id="scopes" style="margin-top:10px"></div>
- <div class="cards" style="margin-top:14px">
-  <div class="card"><div class="k">دانلود کاربران</div><div class="v down" id="c_tx">—</div></div>
-  <div class="card"><div class="k">آپلود کاربران</div><div class="v up" id="c_rx">—</div></div>
-  <div class="card"><div class="k">مجموع</div><div class="v" id="c_tot">—</div><div class="s" id="c_tot_s"></div></div>
-  <div class="card"><div class="k">سرعت همین الان</div><div class="v" id="c_live">—</div></div>
+ <div class="scopes" id="scopes"></div>
+ <div class="kpis">
+  <div class="kpi main"><div class="k">مجموع</div><div class="v" id="c_tot">—</div><div class="s" id="c_tot_s"></div></div>
+  <div class="kpi"><div class="k">دانلود کاربران</div><div class="v" id="c_tx">—</div></div>
+  <div class="kpi"><div class="k">آپلود کاربران</div><div class="v" id="c_rx">—</div></div>
+  <div class="kpi"><div class="k"><i class="led" id="led"></i>سرعت همین الان</div><div class="v" id="c_live">—</div><div class="s" id="c_live_s"></div></div>
  </div>
- <div class="panel" style="margin-top:16px"><h2><span id="chart_title">مصرف روزانه</span><span class="muted" id="range_lbl" style="font-weight:400;font-size:13px"></span></h2><div class="chart" id="chart"></div><div class="legend" id="legend"></div></div>
- <div class="panel" style="margin-top:16px"><h2>گروه‌ها و پورت‌ها <span class="muted" style="font-size:12px;font-weight:400">روی گروه بزنید تا پورت‌هایش باز شود · روی توضیح بزنید تا ویرایش شود</span></h2>
+ <div class="panel"><div class="ph"><div><h2 id="chart_title">مصرف روزانه</h2><span class="sub" id="range_lbl"></span></div><div class="legend" id="legend"></div></div><div class="chart" id="chart"></div></div>
+ <div class="panel"><div class="ph"><h2>گروه‌ها و پورت‌ها</h2></div>
   <div class="scroll"><table><thead><tr><th>گروه / پورت</th><th>دانلود</th><th>آپلود</th><th>مجموع</th><th>سهم</th><th>الان</th></tr></thead><tbody id="tbl"></tbody></table></div></div>
 </section>
 <section id="sys" class="hide">
- <div class="bar"><span class="muted">بازهٔ نمودار:</span><button class="chip" data-h="1">۱ ساعت</button><button class="chip" data-h="6">۶ ساعت</button><button class="chip on" data-h="24">۲۴ ساعت</button><button class="chip" data-h="72">۳ روز</button><button class="chip" data-h="168">۷ روز</button><span class="muted" id="sys_info" style="font-size:13px"></span></div>
- <div class="cards" style="margin-top:14px" id="sys_cards"></div>
- <div class="mgrid" style="margin-top:16px">
-  <div class="panel"><h2>پردازنده (٪)</h2><div class="chart" id="ch_cpu"></div></div>
-  <div class="panel"><h2>رم (٪)</h2><div class="chart" id="ch_mem"></div></div>
-  <div class="panel"><h2>شبکه (کارت اصلی) <span class="muted" style="font-size:12px;font-weight:400"><span class="mini" style="background:var(--down)"></span>دریافت <span class="mini" style="background:var(--up)"></span>ارسال</span></h2><div class="chart" id="ch_net"></div></div>
-  <div class="panel"><h2>پرمصرف‌ترین برنامه‌ها</h2><div class="scroll"><table><thead><tr><th>برنامه</th><th>پردازنده</th><th>رم</th></tr></thead><tbody id="top"></tbody></table></div></div>
+ <div class="tools"><div class="seg" aria-label="بازهٔ نمودار"><button data-h="1">۱ ساعت</button><button data-h="6">۶ ساعت</button><button class="on" data-h="24">۲۴ ساعت</button><button data-h="72">۳ روز</button><button data-h="168">۷ روز</button></div><span class="sub" id="sys_info"></span></div>
+ <div class="cards" id="sys_cards"></div>
+ <div class="sgrid">
+  <div class="panel w4"><div class="ph"><h2>شبکه، کارت اصلی</h2><div class="legend"><span><i class="dot" style="background:var(--dn)"></i>دریافت</span><span><i class="dot" style="background:var(--upc)"></i>ارسال</span></div></div><div class="chart" id="ch_net"></div></div>
+  <div class="panel w2"><div class="ph"><h2>پرمصرف‌ترین برنامه‌ها</h2></div><div class="scroll"><table><thead><tr><th>برنامه</th><th>پردازنده</th><th>رم</th></tr></thead><tbody id="top"></tbody></table></div></div>
+  <div class="panel w3"><div class="ph"><h2>پردازنده</h2><span class="sub">درصد</span></div><div class="chart" id="ch_cpu"></div></div>
+  <div class="panel w3"><div class="ph"><h2>رم</h2><span class="sub">درصد</span></div><div class="chart" id="ch_mem"></div></div>
  </div>
 </section>
 <section id="mgr" class="hide">
  <div class="mgrid">
-  <div class="panel"><h2>گروه‌ها</h2><div id="glist"></div>
-   <div class="row"><input id="g_name" placeholder="نام گروه جدید"><input id="g_color" type="color"><button class="btn pri" id="g_add">افزودن گروه</button></div></div>
-  <div class="panel"><h2>افزودن پورت</h2>
-   <div class="row"><input id="p_port" type="number" min="1" max="65535" placeholder="شمارهٔ پورت" style="width:130px"><input id="p_label" placeholder="توضیح (مثلاً: سرور آلمان، تانل اصلی)" style="flex:1;min-width:180px"></div>
-   <div class="row"><span class="muted" style="font-size:13px">گروه‌ها (می‌شود چندتا را زد):</span><div class="gsel" id="p_groups"></div></div>
-   <div class="row"><button class="btn pri" id="p_add">افزودن پورت</button></div>
-   <h2 style="border-top:1px solid var(--line)">پورت‌های باز روی سرور</h2><div class="muted" style="padding:10px 14px 0;font-size:13px">پورت‌هایی که الان روی سرور گوش می‌دهند؛ «انتخاب» شماره را در فرم بالا می‌گذارد.</div><div id="llist"></div></div>
+  <div class="panel"><div class="ph"><h2>گروه‌ها</h2></div>
+   <div class="form"><div class="field grow"><label for="g_name">گروه جدید</label><input id="g_name" placeholder="مثلاً آلمان"></div>
+    <div class="field"><label for="g_color">رنگ</label><input id="g_color" type="color"></div><button class="btn pri" id="g_add">افزودن گروه</button></div>
+   <div id="glist"></div></div>
+  <div class="panel"><div class="ph"><h2>افزودن پورت</h2></div>
+   <div class="form"><div class="field"><label for="p_port">پورت</label><input id="p_port" type="number" min="1" max="65535" inputmode="numeric" style="width:120px"></div>
+    <div class="field grow"><label for="p_label">توضیح</label><input id="p_label" placeholder="مثلاً تانل اصلی به آلمان"></div></div>
+   <div class="form col"><span class="lab">گروه‌ها، هر چندتا که لازم است</span><div class="gsel" id="p_groups"></div></div>
+   <div class="form"><button class="btn pri" id="p_add">افزودن پورت</button></div>
+   <div class="ph" style="border-top:1px solid var(--line)"><h2>پورت‌های باز روی سرور</h2></div>
+   <p class="cap">پورت‌هایی که الان روی سرور گوش می‌دهند. «انتخاب» شماره را در فرم بالا می‌گذارد.</p><div id="llist"></div></div>
  </div>
- <div class="panel" style="margin-top:16px"><h2>پورت‌های زیر نظر <span class="muted" style="font-size:12px;font-weight:400">توضیح و گروه‌ها خودکار ذخیره می‌شوند</span></h2><div id="plist"></div></div>
- <div class="panel" style="margin-top:16px"><h2>تغییر رمز</h2><div class="row"><input id="pw_old" type="password" placeholder="رمز فعلی"><input id="pw_new" type="password" placeholder="رمز جدید (حداقل ۸)"><button class="btn pri" id="pw_btn">ذخیره</button></div></div>
+ <div class="panel"><div class="ph"><h2>پورت‌های زیر نظر</h2><span class="sub">توضیح و گروه‌ها خودکار ذخیره می‌شوند</span></div><div id="plist"></div></div>
+ <div class="panel"><div class="ph"><h2>تغییر رمز</h2></div>
+  <div class="form"><div class="field"><label for="pw_old">رمز فعلی</label><input id="pw_old" type="password" autocomplete="current-password"></div>
+   <div class="field"><label for="pw_new">رمز جدید</label><input id="pw_new" type="password" autocomplete="new-password" aria-describedby="pw_h"></div>
+   <button class="btn pri" id="pw_btn">ذخیره</button></div><p class="cap" id="pw_h">رمز جدید دست‌کم ۸ نویسه</p></div>
 </section>
-</main><div class="tip" id="tip"></div><div class="toast" id="toast"></div>
+</main><div class="tip" id="tip"></div><div class="toast" id="toast" role="status"></div>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-const fa=n=>Number(n).toLocaleString('fa-IR');
-function bytes(b){const u=['بایت','KB','MB','GB','TB','PB'];let i=0;b=Number(b)||0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toLocaleString('fa-IR',{maximumFractionDigits:(b>=100||i==0)?0:(b>=10?1:2)})+' '+u[i]}
-function rate(bps){const u=['bps','Kbps','Mbps','Gbps'];let i=0,v=(Number(bps)||0)*8;while(v>=1000&&i<u.length-1){v/=1000;i++}return v.toLocaleString('fa-IR',{maximumFractionDigits:v>=100?0:1})+' '+u[i]}
-const jal=d=>new Intl.DateTimeFormat('fa-IR-u-ca-persian',{month:'short',day:'numeric'}).format(new Date(d+'T12:00:00'));
-const jalFull=d=>new Intl.DateTimeFormat('fa-IR-u-ca-persian',{weekday:'short',year:'numeric',month:'long',day:'numeric'}).format(new Date(d+'T12:00:00'));
-const clock=ts=>new Intl.DateTimeFormat('fa-IR-u-ca-persian',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'Asia/Tehran'}).format(new Date(ts*1000));
+const fa=(n,d)=>Number(n).toLocaleString('fa-IR',d==null?undefined:{maximumFractionDigits:d});
+const IC={chev:'<path d="m15 18-6-6 6-6"/>',pen:'<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>',
+  down:'<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',up:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>'};
+const ico=(k,s)=>`<svg class="ic" viewBox="0 0 24 24" width="${s||16}" height="${s||16}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[k]}</svg>`;
+function unit(b){const u=['بایت','KB','MB','GB','TB','PB'];let i=0;b=Number(b)||0;while(b>=1024&&i<u.length-1){b/=1024;i++}
+  return [b.toLocaleString('fa-IR',{maximumFractionDigits:(b>=100||i==0)?0:(b>=10?1:2)}),u[i]]}
+function rateU(bps){const u=['bps','Kbps','Mbps','Gbps'];let i=0,v=(Number(bps)||0)*8;while(v>=1000&&i<u.length-1){v/=1000;i++}
+  return [v.toLocaleString('fa-IR',{maximumFractionDigits:v>=100?0:1}),u[i]]}
+const bytes=b=>Number(b)?unit(b).join(' '):'۰', rate=bps=>rateU(bps).join(' ');
+const nb=b=>`<span class="nw">${bytes(b)}</span>`, nr=bps=>`<span class="nw">${rate(bps)}</span>`;
+const Q=([n,u])=>`<span class="q"><span>${n}</span>${u?`<small>${u}</small>`:''}</span>`;
+const QB=b=>Number(b)?Q(unit(b)):Q(['۰','']), QR=bps=>Q(rateU(bps));
+const DF=o=>new Intl.DateTimeFormat('fa-IR-u-ca-persian',o), D=d=>new Date(d+'T12:00:00');
+const jal=d=>DF({month:'short',day:'numeric'}).format(D(d));
+const jalFull=d=>DF({weekday:'long',year:'numeric',month:'long',day:'numeric'}).format(D(d));
+function jalRange(a,b){if(a==b)return jalFull(a);const f=DF({year:'numeric',month:'long',day:'numeric'});
+  try{return f.formatRange(D(a),D(b))}catch(e){return f.format(D(a))+' تا '+f.format(D(b))}}
+const clock=(ts,o)=>DF(Object.assign({hour:'2-digit',minute:'2-digit',timeZone:'Asia/Tehran'},o||{})).format(new Date(ts*1000));
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let CFG=null,OPEN=new Set(),RANGE='7',SCOPE='all',HOURS=24;
+let CFG=null,OPEN=new Set(),RANGE='7',SCOPE='all',HOURS=24;const LAST={};
 async function api(p,body){const r=await fetch(p,body?{method:'POST',headers:{'Content-Type':'application/json','X-PM':'1'},body:JSON.stringify(body)}:{});if(r.status==401){location='/login';throw 0}const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
-function toast(t){const e=$('#toast');e.textContent=t;e.style.display='block';clearTimeout(e._t);e._t=setTimeout(()=>e.style.display='none',2600)}
+function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),2600)}
 function addDays(iso,n){const d=new Date(iso+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)}
 function rangeDates(r){const t=CFG.today;if(r=='today')return[t,t];if(r=='yesterday'){const y=addDays(t,-1);return[y,y]}return[addDays(t,-(Number(r)-1)),t]}
 const G=id=>CFG.groups.find(g=>String(g.id)===String(id));
-const gColor=id=>(G(id)||{}).color||'#8a8f98';
+const gColor=id=>(G(id)||{}).color||'#85858b';
 const pLabel=p=>{const x=CFG.ports.find(q=>q.port==p);return x&&x.label?x.label:''};
+const width=el=>Math.max(280,Math.round($(el).clientWidth-24));
+/* the link light: lit while samples keep coming, one blink for each new one, grey once the collector stops */
+function led(el,ts,interval){if(!el)return;const age=Date.now()/1000-(ts||0),fresh=!!ts&&age<3*Math.max(60,interval||60);
+  el.classList.toggle('on',fresh);el.title=ts?`آخرین نمونه ${fa(Math.max(0,Math.round(age/60)))} دقیقه پیش`:'هنوز نمونه‌ای نیست';
+  if(fresh&&el._ts!==ts){el._ts=ts;el.classList.remove('blink');void el.offsetWidth;el.classList.add('blink')}}
+function tipAt(e,h){const tip=$('#tip');tip.innerHTML=h;tip.style.display='block';const w=tip.offsetWidth,ht=tip.offsetHeight;
+  tip.style.left=Math.max(8,Math.min(e.clientX+16,innerWidth-w-8))+'px';tip.style.top=Math.max(8,Math.min(e.clientY+16,innerHeight-ht-8))+'px'}
+const tipOff=()=>$('#tip').style.display='none';
 
 /* ---------------- usage report ---------------- */
 function renderScopes(){
-  const all=`<button class="chip ${SCOPE=='all'?'on':''}" data-s="all">همهٔ پورت‌ها</button>`;
-  $('#scopes').innerHTML='<span class="muted">نمایش:</span>'+all+CFG.groups.map(g=>`<button class="chip gchip ${SCOPE==String(g.id)?'on':''}" data-s="${g.id}" style="border-color:${g.color};${SCOPE==String(g.id)?'background:'+g.color:''}"><span class="dot" style="background:${SCOPE==String(g.id)?'#fff':g.color};margin:0"></span>${esc(g.name)}</button>`).join('');
+  const one=(s,label,c)=>`<button class="chip ${SCOPE==s?'on':''}" data-s="${s}">${c?`<i class="dot" style="background:${c}"></i>`:''}${label}</button>`;
+  $('#scopes').innerHTML='<span>نمایش</span>'+one('all','همهٔ پورت‌ها')+CFG.groups.map(g=>one(String(g.id),esc(g.name),g.color)).join('');
   $$('#scopes [data-s]').forEach(b=>b.onclick=()=>{SCOPE=b.dataset.s;renderScopes();load()});
 }
 async function load(){
@@ -849,96 +946,117 @@ async function load(){
   $('#from').value=f;$('#to').value=t;
   const sq=SCOPE=='all'?'':`&group=${SCOPE}`;
   const R=await api(`/api/report?from=${f}&to=${t}${sq}`);
-  $('#c_rx').textContent=bytes(R.total.rx);$('#c_tx').textContent=bytes(R.total.tx);$('#c_tot').textContent=bytes(R.total.rx+R.total.tx);
+  $('#c_rx').innerHTML=QB(R.total.rx);$('#c_tx').innerHTML=QB(R.total.tx);$('#c_tot').innerHTML=QB(R.total.rx+R.total.tx);
   const g=SCOPE=='all'?null:G(SCOPE);
   $('#c_tot_s').textContent=g?`گروه «${g.name}»`:'هر پورت یک بار حساب شده';
-  $('#c_live').innerHTML=`<span style="color:var(--down)">↓ ${rate(R.live.tx_bps)}</span> <span style="color:var(--up);font-size:14px">↑ ${rate(R.live.rx_bps)}</span>`;
-  $('#range_lbl').textContent=f==t?jalFull(f):`${jalFull(f)} تا ${jalFull(t)}`;
+  $('#c_live').innerHTML=ico('down',18)+QR(R.live.tx_bps);
+  $('#c_live_s').innerHTML=`${ico('up',12)} ${rate(R.live.rx_bps)} آپلود`;
+  led($('#led'),R.live.ts,R.live.interval);
+  $('#range_lbl').textContent=jalRange(f,t);
   renderTable(R);
-  if(f==t){const H=await api(`/api/hourly?day=${f}${sq}`);$('#chart_title').textContent='مصرف ساعتی';drawUsage(H.hours.map(x=>({lbl:fa(Number(x.key)),full:`ساعت ${fa(Number(x.key))} تا ${fa(Number(x.key)+1)}`,...x})))}
-  else{$('#chart_title').textContent='مصرف روزانه';drawUsage(R.days.map(x=>({lbl:jal(x.key),full:jalFull(x.key),...x})))}
+  if(f==t){const H=await api(`/api/hourly?day=${f}${sq}`);$('#chart_title').textContent='مصرف ساعتی';
+    drawUsage(H.hours.map(x=>({lbl:fa(Number(x.key)),full:`ساعت ${fa(Number(x.key))} تا ${fa(Number(x.key)+1)}`,...x})))}
+  else{$('#chart_title').textContent='مصرف روزانه';
+    drawUsage(R.days.map(x=>({lbl:x.key==CFG.today?'امروز':jal(x.key),full:jalFull(x.key)+(x.key==CFG.today?'، تا این لحظه':''),now:x.key==CFG.today,...x})))}
 }
 function renderTable(R){
   const P={};R.ports.forEach(p=>P[p.port]=p);
   const scopeTot=(R.total.rx+R.total.tx)||1;let h='';
+  const share=(v,c)=>`<span class="share"><span class="bar"><i style="width:${Math.max(2,Math.round(100*v/scopeTot))}%;background:${c}"></i></span>${fa(Math.round(100*v/scopeTot))}٪</span>`;
   const portRow=(p,gid,color)=>{const pt=p.rx+p.tx;const others=p.groups.filter(x=>String(x)!==String(gid));
-    return `<tr class="p ${OPEN.has(String(gid))||SCOPE!='all'?'':'hide'}" data-pg="${gid}" style="--gc:${color}"><td>پورت ${fa(p.port)} ${others.map(o=>`<span class="mini" title="${esc((G(o)||{}).name)}" style="background:${gColor(o)}"></span>`).join('')}<br><span class="desc ${p.label?'':'empty'}" data-ed="${p.port}">${p.label?esc(p.label):'+ توضیح'}</span></td><td>${bytes(p.tx)}</td><td>${bytes(p.rx)}</td><td><b>${bytes(pt)}</b></td><td>${fa(Math.round(100*pt/scopeTot))}٪</td><td>${rate(p.live.rx_bps+p.live.tx_bps)}</td></tr>`};
+    return `<tr class="p ${OPEN.has(String(gid))||SCOPE!='all'?'':'hide'}" data-pg="${gid}"><td><span class="pp">پورت ${fa(p.port)}${others.map(o=>`<i class="dot" title="${esc((G(o)||{}).name)}" style="background:${gColor(o)}"></i>`).join('')}</span>`
+      +`<span class="desc ${p.label?'':'empty'}" data-ed="${p.port}">${p.label?esc(p.label):'افزودن توضیح'}${ico('pen',12)}</span></td>`
+      +`<td>${QB(p.tx)}</td><td>${QB(p.rx)}</td><td>${QB(pt)}</td><td>${share(pt,color)}</td><td class="dim">${rate(p.live.rx_bps+p.live.tx_bps)}</td></tr>`};
+  const groupRow=(gid,name,color,n,tx,rx,live)=>`<tr class="g ${OPEN.has(gid)?'open':''}" data-g="${gid}"><td><span class="gn">${ico('chev')}<i class="dot" style="background:${color}"></i>${name}<span class="cnt">${fa(n)} پورت</span></span></td>`
+      +`<td>${QB(tx)}</td><td>${QB(rx)}</td><td>${QB(tx+rx)}</td><td>${share(tx+rx,color)}</td><td class="dim">${rate(live)}</td></tr>`;
   const groups=SCOPE=='all'?R.groups:R.groups.filter(g=>String(g.id)===SCOPE);
-  for(const g of groups){const tot=g.rx+g.tx;const gid=String(g.id);
-    if(SCOPE=='all')h+=`<tr class="g" data-g="${gid}" style="--gc:${g.color};background:color-mix(in srgb,${g.color} 10%,var(--card))"><td><span class="dot" style="background:${g.color}"></span>${esc(g.name)} <span class="muted" style="font-weight:400">(${fa(g.ports.length)} پورت)</span></td><td>${bytes(g.tx)}</td><td>${bytes(g.rx)}</td><td>${bytes(tot)}</td><td><span class="share" style="width:${Math.max(2,Math.round(60*tot/scopeTot))}px;background:${g.color}"></span>${fa(Math.round(100*tot/scopeTot))}٪</td><td>${rate(g.live)}</td></tr>`;
+  for(const g of groups){const gid=String(g.id);
+    if(SCOPE=='all')h+=groupRow(gid,esc(g.name),g.color,g.ports.length,g.tx,g.rx,g.live);
     h+=g.ports.map(x=>P[x]).sort((a,b)=>(b.rx+b.tx)-(a.rx+a.tx)).map(p=>portRow(p,gid,g.color)).join('')}
-  if(SCOPE=='all'&&R.ungrouped.length){const ug=R.ungrouped.map(x=>P[x]);const rx=ug.reduce((a,p)=>a+p.rx,0),tx=ug.reduce((a,p)=>a+p.tx,0);
-    h+=`<tr class="g" data-g="none" style="--gc:#8a8f98"><td><span class="dot" style="background:#8a8f98"></span>بدون گروه <span class="muted" style="font-weight:400">(${fa(ug.length)} پورت)</span></td><td>${bytes(tx)}</td><td>${bytes(rx)}</td><td>${bytes(rx+tx)}</td><td>${fa(Math.round(100*(rx+tx)/scopeTot))}٪</td><td>${rate(ug.reduce((a,p)=>a+p.live.rx_bps+p.live.tx_bps,0))}</td></tr>`;
-    h+=ug.sort((a,b)=>(b.rx+b.tx)-(a.rx+a.tx)).map(p=>portRow(p,'none','#8a8f98')).join('')}
-  h+=`<tr class="tot"><td>${SCOPE=='all'?'کل (هر پورت یک بار)':'کل گروه'}</td><td>${bytes(R.total.tx)}</td><td>${bytes(R.total.rx)}</td><td>${bytes(R.total.rx+R.total.tx)}</td><td>۱۰۰٪</td><td>${rate(R.live.rx_bps+R.live.tx_bps)}</td></tr>`;
-  $('#tbl').innerHTML=R.ports.length?h:'<tr><td colspan="6" class="muted">هنوز پورتی زیر نظر نیست؛ از «تنظیمات» اضافه کنید.</td></tr>';
-  $$('#tbl tr.g').forEach(tr=>tr.onclick=()=>{const g=tr.dataset.g;OPEN.has(g)?OPEN.delete(g):OPEN.add(g);$$(`#tbl tr[data-pg="${g}"]`).forEach(x=>x.classList.toggle('hide'))});
+  if(SCOPE=='all'&&R.ungrouped.length){const ug=R.ungrouped.map(x=>P[x]);
+    h+=groupRow('none','بدون گروه','#85858b',ug.length,ug.reduce((a,p)=>a+p.tx,0),ug.reduce((a,p)=>a+p.rx,0),ug.reduce((a,p)=>a+p.live.rx_bps+p.live.tx_bps,0));
+    h+=ug.sort((a,b)=>(b.rx+b.tx)-(a.rx+a.tx)).map(p=>portRow(p,'none','#85858b')).join('')}
+  h+=`<tr class="tot"><td>${SCOPE=='all'?'کل، هر پورت یک بار':'کل گروه'}</td><td>${QB(R.total.tx)}</td><td>${QB(R.total.rx)}</td><td>${QB(R.total.rx+R.total.tx)}</td><td>۱۰۰٪</td><td>${rate(R.live.rx_bps+R.live.tx_bps)}</td></tr>`;
+  $('#tbl').innerHTML=R.ports.length?h:'<tr><td colspan="6" class="empty">هنوز پورتی زیر نظر نیست؛ از «تنظیمات» اضافه کنید</td></tr>';
+  $$('#tbl tr.g').forEach(tr=>tr.onclick=()=>{const g=tr.dataset.g;OPEN.has(g)?OPEN.delete(g):OPEN.add(g);tr.classList.toggle('open');$$(`#tbl tr[data-pg="${g}"]`).forEach(x=>x.classList.toggle('hide'))});
   $$('#tbl [data-ed]').forEach(e=>e.onclick=ev=>{ev.stopPropagation();const p=e.dataset.ed;const v=prompt(`توضیح پورت ${p}:`,pLabel(p));if(v!==null)act('/api/port',{action:'edit',port:p,label:v})});
 }
 function axis(max){let step=Math.pow(1024,Math.floor(Math.log(Math.max(max,1))/Math.log(1024)));const nice=[1,2,5,10,20,50,100,200,500,1000].map(m=>m*step).find(v=>v*4>=max)||max/4;return nice}
 function drawUsage(items){
-  const W=1000,H=240,pl=8,pr=62,pt=10,pb=26,n=items.length||1,bw=(W-pl-pr)/n;
-  const multi=SCOPE=='all'&&CFG.groups.length>0;
+  LAST.usage=items;
+  const W=width('#chart'),H=innerWidth<640?220:300,pl=4,pr=64,pt=12,pb=28,n=items.length||1,bw=(W-pl-pr)/n,barW=Math.max(2,Math.min(32,bw*.6));
+  const multi=SCOPE=='all'&&CFG.groups.length>0,col=multi?'var(--t1)':(SCOPE=='all'?'var(--c1)':gColor(SCOPE));
   const vals=multi?items.flatMap(x=>[x.total,...Object.values(x.groups)]):items.map(x=>x.total);
   const nice=axis(Math.max(1,...vals)),top=nice*4,y=v=>pt+(H-pt-pb)*(1-v/top),xc=i=>W-pr-(i+.5)*bw;
-  let s=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" font-family="Vazirmatn,Tahoma" font-size="11" style="direction:ltr">`;
-  for(let i=0;i<=4;i++){const v=nice*i;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${W-pr+6}" y="${y(v)+4}" fill="var(--muted)">${bytes(v)}</text>`}
-  if(multi){
-    s+=items.map((it,i)=>`<rect x="${xc(i)-bw*.35}" y="${y(it.total)}" width="${bw*.7}" height="${Math.max(0,y(0)-y(it.total))}" fill="var(--muted)" opacity=".18" rx="2"/>`).join('');
-    for(const g of CFG.groups){const pts=items.map((it,i)=>`${xc(i)},${y(it.groups[String(g.id)]||0)}`);
-      s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${g.color}" stroke-width="2.4" stroke-linejoin="round"/>`;
-      if(n<=45)s+=items.map((it,i)=>`<circle cx="${xc(i)}" cy="${y(it.groups[String(g.id)]||0)}" r="3" fill="${g.color}"/>`).join('')}
-  }else{const c=SCOPE=='all'?'var(--acc)':gColor(SCOPE);s+=items.map((it,i)=>`<rect x="${xc(i)-bw*.35}" y="${y(it.total)}" width="${bw*.7}" height="${Math.max(0,y(0)-y(it.total))}" fill="${c}" rx="2"/>`).join('')}
+  let s=`<svg class="plot" viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="${esc($('#chart_title').textContent)}">`
+    +`<defs><pattern id="now" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" stroke="${col}" stroke-width="2"/></pattern></defs>`
+    +`<rect id="hov" y="${pt}" height="${H-pt-pb}" width="${bw}" fill="var(--t1)" opacity="0" rx="4"/>`;
+  for(let i=0;i<=4;i++){const v=nice*i;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line${i?'':'2'})"/><text x="${W-pr+12}" y="${y(v)+4}">${bytes(v)}</text>`}
+  const op=multi?.12:1;
+  s+=items.map((it,i)=>`<rect x="${xc(i)-barW/2}" y="${y(it.total)}" width="${barW}" height="${Math.max(0,y(0)-y(it.total))}" fill="${it.now?'url(#now)':col}" opacity="${it.now?op*1.6:op}" rx="2"/>`).join('');
+  if(multi)for(const g of CFG.groups){const pts=items.map((it,i)=>`${xc(i)},${y(it.groups[String(g.id)]||0)}`);
+    s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${g.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    if(n<=31)s+=items.map((it,i)=>`<circle cx="${xc(i)}" cy="${y(it.groups[String(g.id)]||0)}" r="3" fill="${g.color}" stroke="var(--card)" stroke-width="1.5"/>`).join('')}
+  const every=Math.ceil(n/Math.max(4,Math.floor(W/64)));
   items.forEach((it,i)=>{s+=`<rect class="hit" data-i="${i}" x="${xc(i)-bw/2}" y="${pt}" width="${bw}" height="${H-pt-pb}" fill="transparent"/>`;
-    if(n<=31||i%Math.ceil(n/31)==0)s+=`<text x="${xc(i)}" y="${H-8}" fill="var(--muted)" text-anchor="middle">${it.lbl}</text>`});
+    if(i%every==0||it.now)s+=`<text x="${xc(i)}" y="${H-8}" text-anchor="middle"${it.now?' style="fill:var(--t1)"':''}>${it.lbl}</text>`});
   $('#chart').innerHTML=s+'</svg>';
-  $('#legend').innerHTML=multi?CFG.groups.map(g=>`<span><span class="dot" style="background:${g.color}"></span>${esc(g.name)}</span>`).join('')+`<span><span class="dot" style="background:var(--muted);opacity:.4"></span>کل (هر پورت یک بار)</span>`:'';
-  const tip=$('#tip');$$('#chart .hit').forEach(r=>{r.onmousemove=e=>{const it=items[r.dataset.i];
-    let h=`<b>${it.full}</b><br>مجموع: <b>${bytes(it.total)}</b>`;
-    if(multi)h+='<br>'+CFG.groups.filter(g=>it.groups[String(g.id)]).map(g=>`<span class="dot" style="background:${g.color}"></span>${esc(g.name)}: ${bytes(it.groups[String(g.id)])}`).join('<br>');
-    if(it.top&&it.top.length)h+='<br><span class="muted">پرمصرف‌ها:</span><br>'+it.top.map(([p,v])=>`پورت ${fa(p)}${pLabel(p)?' ('+esc(pLabel(p))+')':''}: ${bytes(v)}`).join('<br>');
-    tip.innerHTML=h;tip.style.display='block';tip.style.left=Math.min(e.clientX+14,innerWidth-260)+'px';tip.style.top=(e.clientY+14)+'px'};r.onmouseleave=()=>tip.style.display='none'})
+  $('#legend').innerHTML=multi?CFG.groups.map(g=>`<span><i class="dot" style="background:${g.color}"></i>${esc(g.name)}</span>`).join('')+`<span><i class="dot" style="background:var(--t1);opacity:.25"></i>کل، هر پورت یک بار</span>`:'';
+  const hov=$('#hov');
+  $$('#chart .hit').forEach(r=>{r.onmousemove=e=>{const it=items[r.dataset.i];hov.setAttribute('x',r.getAttribute('x'));hov.setAttribute('opacity','.05');
+    let h=`<b>${it.full}</b><div class="r"><span>مجموع</span>${bytes(it.total)}</div>`;
+    if(multi)h+=CFG.groups.filter(g=>it.groups[String(g.id)]).map(g=>`<div class="r"><span><i class="dot" style="background:${g.color}"></i>${esc(g.name)}</span>${bytes(it.groups[String(g.id)])}</div>`).join('');
+    if(it.top&&it.top.length)h+='<div class="hd">پرمصرف‌ها</div>'+it.top.map(([p,v])=>`<div class="r"><span>پورت ${fa(p)}${pLabel(p)?' · '+esc(pLabel(p)).slice(0,28):''}</span>${bytes(v)}</div>`).join('');
+    tipAt(e,h)};r.onmouseleave=()=>{tipOff();hov.setAttribute('opacity','0')}})
 }
 
 /* ---------------- server resources ---------------- */
-function lineChart(el,hist,series,fmt,maxFixed){
-  const W=1000,H=200,pl=8,pr=70,pt=10,pb=24,n=hist.length;if(!n){$(el).innerHTML='<div class="muted" style="padding:20px">هنوز داده‌ای نیست؛ چند دقیقه صبر کنید.</div>';return}
-  const t0=hist[0].ts,t1=hist[n-1].ts||t0+1,x=ts=>pl+(W-pl-pr)*(t1==t0?1:(ts-t0)/(t1-t0));
-  const max=maxFixed||Math.max(1e-9,...hist.flatMap(h=>series.map(s=>h[s.k]||0)))*1.15,y=v=>pt+(H-pt-pb)*(1-v/max);
-  let s=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" font-family="Vazirmatn,Tahoma" font-size="11" style="direction:ltr;height:200px">`;
-  for(let i=0;i<=4;i++){const v=max*i/4;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${W-pr+6}" y="${y(v)+4}" fill="var(--muted)">${fmt(v)}</text>`}
-  for(const se of series){const pts=hist.map(h=>`${x(h.ts)},${y(h[se.k]||0)}`).join(' ');
-    s+=`<polygon points="${x(t0)},${y(0)} ${pts} ${x(t1)},${y(0)}" fill="${se.c}" opacity=".12"/><polyline points="${pts}" fill="none" stroke="${se.c}" stroke-width="2"/>`}
-  for(let i=0;i<5;i++){const ts=t0+(t1-t0)*i/4;s+=`<text x="${x(ts)}" y="${H-6}" fill="var(--muted)" text-anchor="${i==0?'start':i==4?'end':'middle'}">${clock(ts)}</text>`}
+function lineChart(el,hist,series,fmt,maxFixed,H){
+  LAST[el]=[hist,series,fmt,maxFixed,H];
+  const W=width(el),pl=4,pr=64,pt=12,pb=28;H=H||180;
+  if(!hist.length){$(el).innerHTML='<div class="empty">هنوز داده‌ای نیست؛ چند دقیقه بعد سر بزنید</div>';return}
+  const k=Math.max(1,Math.ceil(hist.length/Math.floor((W-pr)/4))),pts=[];   /* one point per ~4px: the shape, not the noise */
+  for(let i=0;i<hist.length;i+=k){const c=hist.slice(i,i+k),o={ts:c[c.length-1].ts};for(const s of series)o[s.k]=c.reduce((a,h)=>a+(h[s.k]||0),0)/c.length;pts.push(o)}
+  const t0=pts[0].ts,t1=pts[pts.length-1].ts||t0+1,x=ts=>W-pr-(W-pl-pr)*(t1==t0?0:(ts-t0)/(t1-t0));
+  const max=maxFixed||Math.max(1e-9,...pts.flatMap(h=>series.map(s=>h[s.k]||0)))*1.15,y=v=>pt+(H-pt-pb)*(1-v/max);
+  let s=`<svg class="plot" viewBox="0 0 ${W} ${H}" height="${H}">`;
+  for(let i=0;i<=4;i++){const v=max*i/4;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line${i?'':'2'})"/>${i%2==0?`<text x="${W-pr+12}" y="${y(v)+4}">${fmt(v)}</text>`:''}`}
+  for(const se of series){const line=pts.map(h=>`${x(h.ts)},${y(h[se.k]||0)}`).join(' ');
+    s+=`<polygon points="${x(t0)},${y(0)} ${line} ${x(t1)},${y(0)}" fill="${se.c}" opacity=".08"/><polyline points="${line}" fill="none" stroke="${se.c}" stroke-width="1.75" stroke-linejoin="round"/>`}
+  const long=HOURS>24;
+  for(let i=0;i<4;i++){const ts=t0+(t1-t0)*i/3;s+=`<text x="${x(ts)}" y="${H-8}" text-anchor="${i==0?'end':i==3?'start':'middle'}">${clock(ts,long?{month:'short',day:'numeric'}:{})}</text>`}
   $(el).innerHTML=s+'</svg>';
 }
-function card(k,v,s,pct,color){return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${s?`<div class="s">${s}</div>`:''}${pct!=null?`<div class="meter"><i style="width:${Math.min(100,pct)}%;background:${color||(pct>85?'var(--bad)':pct>65?'var(--up)':'var(--down)')}"></i></div>`:''}</div>`}
+function card(k,v,s,pct,lit){const tone=pct==null?'':pct>90?'bad':pct>70?'warn':'';
+  return `<div class="kpi ${tone}"><div class="k">${lit?'<i class="led" id="led_sys"></i>':''}${k}</div><div class="v">${v}</div>${s?`<div class="s">${s}</div>`:''}${pct!=null?`<div class="meter"><i style="width:${Math.max(1,Math.min(100,pct))}%"></i></div>`:''}</div>`}
 function dur(s){if(s==null)return'';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?fa(d)+' روز ':'')+(h?fa(h)+' ساعت ':'')+(d?'':fa(m)+' دقیقه')}
 async function loadSys(){
   const S=await api(`/api/system?hours=${HOURS}`),n=S.now||{},i=S.info;
-  $('#sys_info').textContent=`${i.host} · ${i.os} · ${fa(i.cores)} هسته · روشن از ${dur(i.uptime)} پیش`;
+  $('#sys_info').textContent=`${i.host} · ${i.os} · ${fa(i.cores)} هسته · روشن از ${dur(i.uptime)}پیش`;
   const memP=n.mem_total?100*n.mem_used/n.mem_total:null,dskP=n.disk_total?100*n.disk_used/n.disk_total:null,ctP=n.ct_max?100*n.ct_count/n.ct_max:null;
+  const pc=v=>v!=null?fa(v,v<10?1:0)+'٪':'…';
   $('#sys_cards').innerHTML=
-    card('پردازنده',n.cpu!=null?fa(n.cpu)+'٪':'…',`بار: ${i.load.map(x=>fa(x)).join(' / ')} · بیشینه در بازه: ${S.peak.cpu!=null?fa(S.peak.cpu)+'٪':'—'}`,n.cpu)+
-    card('رم',memP!=null?fa(Math.round(memP))+'٪':'…',`${bytes(n.mem_used)} از ${bytes(n.mem_total)}${n.swap_total?` · سواپ ${bytes(n.swap_used)}`:''}`,memP)+
-    card('دیسک',dskP!=null?fa(Math.round(dskP))+'٪':'…',`${bytes(n.disk_used)} از ${bytes(n.disk_total)}`,dskP)+
-    card('شبکه همین الان',n.net_rx!=null?`<span style="color:var(--down)">↓ ${rate(n.net_rx)}</span>`:'…',n.net_tx!=null?`<span style="color:var(--up)">↑ ${rate(n.net_tx)}</span> · کارت ${esc(n.iface||'')}`:'',null)+
-    card('اتصال‌ها',n.tcp!=null?fa(n.tcp):'—',ctP!=null?`ردیابی اتصال: ${fa(n.ct_count)} از ${fa(n.ct_max)}`:'',ctP);
-  lineChart('#ch_cpu',S.history,[{k:'cpu',c:'var(--acc)'}],v=>fa(Math.round(v))+'٪',100);
-  lineChart('#ch_mem',S.history,[{k:'mem',c:'#a78bfa'}],v=>fa(Math.round(v))+'٪',100);
-  lineChart('#ch_net',S.history,[{k:'rx',c:'var(--down)'},{k:'tx',c:'var(--up)'}],v=>rate(v));
-  $('#top').innerHTML=S.top.map(p=>`<tr><td>${esc(p.name)} <span class="muted" style="font-size:12px">#${fa(p.pid)}</span></td><td>${fa(p.cpu)}٪</td><td>${bytes(p.rss)}</td></tr>`).join('');
+    card('پردازنده',pc(n.cpu),`بار ${i.load.map(x=>fa(x)).join(' / ')} · بیشینه ${S.peak.cpu!=null?fa(S.peak.cpu,0)+'٪':'—'}`,n.cpu)+
+    card('رم',pc(memP),`${nb(n.mem_used)} از ${nb(n.mem_total)}${n.swap_total?` · سواپ ${nb(n.swap_used)}`:''}`,memP)+
+    card('دیسک',pc(dskP),`${nb(n.disk_used)} از ${nb(n.disk_total)}`,dskP)+
+    card('شبکه همین الان',n.net_rx!=null?ico('down',18)+QR(n.net_rx):'…',n.net_tx!=null?`${ico('up',12)} ${nr(n.net_tx)} · کارت ${esc(n.iface||'')}`:'',null,true)+
+    card('اتصال‌ها',n.tcp!=null?fa(n.tcp):'—',ctP!=null?`ردیابی ${fa(n.ct_count)} از ${fa(n.ct_max)}`:'',ctP);
+  led($('#led_sys'),n.ts,60);
+  lineChart('#ch_net',S.history,[{k:'rx',c:'var(--dn)'},{k:'tx',c:'var(--upc)'}],v=>rate(v),0,innerWidth<640?200:260);
+  lineChart('#ch_cpu',S.history,[{k:'cpu',c:'var(--t2)'}],v=>fa(Math.round(v))+'٪',100);
+  lineChart('#ch_mem',S.history,[{k:'mem',c:'var(--t2)'}],v=>fa(Math.round(v))+'٪',100);
+  $('#top').innerHTML=S.top.map(p=>`<tr><td><bdi>${esc(p.name)}</bdi><span class="pid">${fa(p.pid)}</span></td><td>${fa(p.cpu,1)}٪</td><td>${QB(p.rss)}</td></tr>`).join('');
 }
 
 /* ---------------- settings ---------------- */
 async function loadCfg(){CFG=await api('/api/config');$('#host').textContent=`${CFG.host} · نسخهٔ ${CFG.version}`;$('#g_color').value=CFG.palette.find(c=>!CFG.groups.some(g=>g.color==c))||CFG.palette[0];renderScopes();renderMgr()}
-function gsel(sel,name){return CFG.groups.map(g=>`<label style="--gc:${g.color}" class="${sel.includes(g.id)?'on':''}"><input type="checkbox" data-${name}="${g.id}" ${sel.includes(g.id)?'checked':''}><span class="dot" style="background:${g.color};margin:0"></span>${esc(g.name)}</label>`).join('')||'<span class="muted" style="font-size:13px">اول یک گروه بسازید.</span>'}
+function gsel(sel,name){return CFG.groups.map(g=>`<label class="${sel.includes(g.id)?'on':''}"><input type="checkbox" data-${name}="${g.id}" ${sel.includes(g.id)?'checked':''}><i class="dot" style="background:${g.color}"></i>${esc(g.name)}</label>`).join('')||'<span class="meta">اول یک گروه بسازید</span>'}
 function renderMgr(){
-  $('#glist').innerHTML=CFG.groups.map(g=>`<div class="row" style="border-right:5px solid ${g.color}"><input type="color" value="${g.color}" data-gc="${g.id}"><input value="${esc(g.name)}" data-gn="${g.id}" style="flex:1;min-width:120px"><span class="muted">${fa(CFG.ports.filter(p=>p.groups.includes(g.id)).length)} پورت</span><button class="btn del" data-gd="${g.id}">حذف</button></div>`).join('')||'<div class="row muted">گروهی نیست.</div>';
+  $('#glist').innerHTML=CFG.groups.map(g=>`<div class="row"><input type="color" value="${g.color}" data-gc="${g.id}" aria-label="رنگ ${esc(g.name)}"><input class="grow" value="${esc(g.name)}" data-gn="${g.id}" aria-label="نام گروه"><span class="meta">${fa(CFG.ports.filter(p=>p.groups.includes(g.id)).length)} پورت</span><button class="btn del sm" data-gd="${g.id}">حذف</button></div>`).join('')||'<div class="row meta">گروهی نیست</div>';
   $('#p_groups').innerHTML=gsel([],'ng');
-  $('#plist').innerHTML=CFG.ports.map(p=>`<div class="prow"><b style="padding-top:8px">${fa(p.port)}</b><div style="display:grid;gap:8px"><textarea data-pl="${p.port}" placeholder="توضیح این پورت">${esc(p.label||'')}</textarea><div class="gsel">${gsel(p.groups,'pg-'+p.port)}</div></div><button class="btn del" data-pd="${p.port}">حذف</button></div>`).join('')||'<div class="row muted">پورتی زیر نظر نیست.</div>';
+  $('#plist').innerHTML=CFG.ports.map(p=>`<div class="prow"><span class="num">${fa(p.port)}</span><div><textarea data-pl="${p.port}" placeholder="توضیح این پورت" aria-label="توضیح پورت ${p.port}">${esc(p.label||'')}</textarea><div class="gsel">${gsel(p.groups,'pg-'+p.port)}</div></div><button class="btn del sm" data-pd="${p.port}">حذف</button></div>`).join('')||'<div class="row meta">پورتی زیر نظر نیست</div>';
   const watched=new Set(CFG.ports.map(p=>p.port));
-  $('#llist').innerHTML=CFG.listening.filter(l=>l.port!==CFG.dashboard_port).map(l=>`<div class="row"><b style="min-width:60px">${fa(l.port)}</b><span class="muted">${l.proto} ${esc(l.process)}</span>${watched.has(l.port)?'<span class="muted">زیر نظر است</span>':`<button class="btn" data-la="${l.port}">انتخاب</button>`}</div>`).join('');
+  $('#llist').innerHTML=CFG.listening.filter(l=>l.port!==CFG.dashboard_port).map(l=>`<div class="row"><span class="num">${fa(l.port)}</span><span class="meta grow">${l.proto} · ${esc(l.process)}</span>${watched.has(l.port)?'<span class="meta">زیر نظر است</span>':`<button class="btn sm" data-la="${l.port}">انتخاب</button>`}</div>`).join('');
   $$('[data-gn]').forEach(e=>e.onchange=()=>act('/api/group',{action:'edit',id:e.dataset.gn,name:e.value}));
   $$('[data-gc]').forEach(e=>e.onchange=()=>act('/api/group',{action:'edit',id:e.dataset.gc,color:e.value}));
   $$('[data-gd]').forEach(e=>e.onclick=()=>confirm('گروه حذف شود؟ پورت‌ها و آمارشان می‌مانند.')&&act('/api/group',{action:'delete',id:e.dataset.gd}));
@@ -957,6 +1075,8 @@ $$('[data-tab]').forEach(b=>b.onclick=()=>{TAB=b.dataset.tab;$$('[data-tab]').fo
 $$('#ranges [data-r]').forEach(b=>b.onclick=()=>{RANGE=b.dataset.r;$$('#ranges [data-r]').forEach(x=>x.classList.toggle('on',x==b));load()});
 $$('[data-h]').forEach(b=>b.onclick=()=>{HOURS=Number(b.dataset.h);$$('[data-h]').forEach(x=>x.classList.toggle('on',x==b));loadSys()});
 $('#apply').onclick=()=>{RANGE='custom';$$('#ranges [data-r]').forEach(x=>x.classList.remove('on'));load()};
+let RT;addEventListener('resize',()=>{clearTimeout(RT);RT=setTimeout(()=>{if(TAB=='rep'&&LAST.usage)drawUsage(LAST.usage);
+  if(TAB=='sys')['#ch_net','#ch_cpu','#ch_mem'].forEach(el=>LAST[el]&&lineChart(el,...LAST[el]))},150)});
 (async()=>{await loadCfg();await load();setInterval(()=>{if(document.hidden)return;TAB=='sys'?loadSys():TAB=='rep'?load():0},60000)})();
 </script></body></html>"""
 

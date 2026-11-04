@@ -45,7 +45,7 @@ fetch() {  # fetch <path in repo> <destination>
 fetch portmon.py /opt/portmon/portmon.py.new
 python3 -c "import ast,sys; ast.parse(open('/opt/portmon/portmon.py.new').read())"
 mv /opt/portmon/portmon.py.new /opt/portmon/portmon.py; chmod 755 /opt/portmon/portmon.py
-for f in Vazirmatn-Regular.woff2 Vazirmatn-Bold.woff2; do fetch "fonts/$f" "/opt/portmon/fonts/$f"; done
+for f in Vazirmatn-Regular.woff2 Vazirmatn-Medium.woff2; do fetch "fonts/$f" "/opt/portmon/fonts/$f"; done
 
 if [ ! -f /etc/portmon/key.pem ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes -subj "/CN=portmon" \
