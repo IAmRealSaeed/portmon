@@ -2,7 +2,7 @@
 # Copy it to the server and run:  sudo bash install_portmon.sh
 import base64, os
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ["portmon.py", "fonts/Vazirmatn-Regular.woff2", "fonts/Vazirmatn-Medium.woff2"]
+FILES = ["portmon.py", "fonts/Vazirmatn-Regular.woff2", "fonts/Vazirmatn-Medium.woff2", "install.sh", "uninstall.sh", "cli.sh"]
 
 body = open(os.path.join(HERE, "install.sh"), encoding="utf-8").read()
 shebang, rest = body.split("\n", 1)

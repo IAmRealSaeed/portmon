@@ -97,17 +97,48 @@ curl -fsSL https://raw.githubusercontent.com/IAmRealSaeed/portmon/main/install.s
 - اگر گرفتن گواهی شکست بخورد، نصب ادامه پیدا می‌کند و داشبورد روی همان گواهی خودامضا می‌ماند. چند خط آخر خطای certbot هم نشان داده می‌شود.
 - با گذاشتن `PM_DOMAIN`، شرایط [Let's Encrypt](https://letsencrypt.org/repository/) را می‌پذیرید.
 
+## دستور `portmon`
+
+بعد از نصب، روی سرور بزنید:
+
+```bash
+sudo portmon
+```
+
+منو بالا می‌آید. نشانی داشبورد، وضعیت سرویس و نوع گواهی را بالای منو نشان می‌دهد:
+
+```
+  1) Update portmon
+  2) Get an SSL certificate for a domain
+  3) Change the password
+  4) Change the port
+  5) Restart
+  6) Status
+  7) Logs
+  8) Uninstall
+  0) Exit
+```
+
+- **۱. به‌روزرسانی:** آخرین نسخه را از GitHub می‌گیرد. اگر سرور به GitHub نرسد، می‌گوید فایل آفلاین را از Releases بیاورید.
+- **۲. گواهی SSL:** دامنه را می‌پرسد و بعد توکن کلادفلر را (بخش «دامنه و گواهی واقعی»). اینترنت لازم دارد ولی GitHub لازم نیست.
+- **۴. تغییر پورت:** پورت تازه را در فایروال سرور خودتان باز کنید.
+- **۸. حذف:** اول تأیید می‌گیرد. بعد می‌پرسد تنظیمات و آمار بماند یا نه. پیش‌فرض این است که بماند.
+
+همه را بدون منو هم می‌شود زد: `portmon update`، `portmon ssl`، `portmon password`، `portmon port`، `portmon restart`، `portmon status`، `portmon log`، `portmon uninstall`.
+
 ## به‌روزرسانی
 
-همان دستور نصب را دوباره اجرا کنید. داده‌ها، گروه‌ها، تنظیمات و رمز می‌مانند. دامنه و گواهی‌اش هم می‌مانند و لازم نیست `PM_DOMAIN` را دوباره بدهید.
+`portmon update`، یا همان دستور نصب را دوباره اجرا کنید. داده‌ها، گروه‌ها، تنظیمات، پورت و رمز می‌مانند. دامنه و گواهی‌اش هم می‌مانند و لازم نیست `PM_DOMAIN` را دوباره بدهید.
 
 ## حذف
+
+`portmon uninstall`، یا:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/IAmRealSaeed/portmon/main/uninstall.sh | sudo bash
 ```
 
-این دستور سرویس، جدول nftables و `/opt/portmon` را پاک می‌کند، ولی تنظیمات و آمار را نگه می‌دارد. برای پاک کردن همه‌چیز:
+این دستور سرویس، جدول nftables، `/opt/portmon` و دستور `portmon` را پاک می‌کند، ولی تنظیمات و آمار را نگه می‌دارد. برای پاک کردن همه‌چیز، از جمله گواهی Let's Encrypt:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/IAmRealSaeed/portmon/main/uninstall.sh | sudo PM_PURGE=1 bash
@@ -117,10 +148,11 @@ curl -fsSL https://raw.githubusercontent.com/IAmRealSaeed/portmon/main/uninstall
 
 | کار | دستور |
 |---|---|
-| وضعیت سرویس | `systemctl status portmon` |
-| لاگ‌ها | `journalctl -u portmon -f` |
-| ری‌استارت | `systemctl restart portmon` |
-| رمز جدید (اگر یادتان رفته) | `read -rs P && echo "$P" \| sudo python3 /opt/portmon/portmon.py --set-password && sudo systemctl restart portmon` |
+| منو | `sudo portmon` |
+| وضعیت سرویس | `portmon status` یا `systemctl status portmon` |
+| لاگ‌ها | `portmon log` یا `journalctl -u portmon -f` |
+| ری‌استارت | `portmon restart` |
+| رمز جدید (اگر یادتان رفته) | `portmon password` |
 | دیدن جدول شمارش | `nft list table inet portmon` |
 
 رمز را از تب «تنظیمات» داشبورد هم می‌شود عوض کرد. افزودن و حذف پورت و ساختن گروه هم از همان‌جا انجام می‌شود.

@@ -59,8 +59,13 @@ if [ -z "${PM_PASSWORD:-}" ] && [ "$HAVE_PW" != 1 ] && { : </dev/tty; } 2>/dev/n
 fi
 if [ -n "${PM_PASSWORD:-}" ]; then [ ${#PM_PASSWORD} -ge 8 ] || { echo "the password must be at least 8 characters"; exit 1; }
 elif [ "$HAVE_PW" != 1 ]; then echo "PM_PASSWORD is required on the first install"; exit 1; fi
-PORT=${PM_PORT:-8800}
-if ss -Htln "( sport = :$PORT )" | grep -q . && ! systemctl is-active --quiet portmon; then echo "port $PORT is already in use"; exit 1; fi
+# An upgrade keeps the port it had; until 2.3 it went back to 8800 unless PM_PORT was given again.
+OLD_PORT=$(python3 -c "import json; print(json.load(open('/etc/portmon/config.json')).get('port') or '')" 2>/dev/null || true)
+PORT=${PM_PORT:-${OLD_PORT:-8800}}
+# Taken is fine only when it is portmon itself, staying on the port it already has.
+if ss -Htln "( sport = :$PORT )" | grep -q . && ! { [ "$PORT" = "$OLD_PORT" ] && systemctl is-active --quiet portmon; }; then
+  echo "port $PORT is already in use"; exit 1
+fi
 
 # Chrome never offers to save a password on a page with a certificate error, and a self-signed certificate is one.
 OLD_DOMAIN=$(python3 -c "import json; print(json.load(open('/etc/portmon/config.json')).get('domain') or '')" 2>/dev/null || true)
@@ -85,12 +90,24 @@ command -v curl >/dev/null || apt_install curl ca-certificates
 install -d -m 755 /opt/portmon /opt/portmon/fonts
 install -d -m 700 /etc/portmon /var/lib/portmon
 fetch() {  # fetch <path in repo> <destination>
-  if [ -n "${PM_SRC:-}" ]; then cp "$PM_SRC/$1" "$2"; else curl -fsSL "$REPO_RAW/$1" -o "$2"; fi
+  # Written beside it and moved over it, so a script that is running from there (the menu) is never edited
+  # under its feet; and the menu's own reinstall reads from where it writes, which is then nothing to copy.
+  if [ -n "${PM_SRC:-}" ]; then
+    [ "$PM_SRC/$1" -ef "$2" ] && return 0
+    cp "$PM_SRC/$1" "$2.new"
+  else
+    curl -fsSL "$REPO_RAW/$1" -o "$2.new"
+  fi
+  mv -f "$2.new" "$2"
 }
 fetch portmon.py /opt/portmon/portmon.py.new
 python3 -c "import ast,sys; ast.parse(open('/opt/portmon/portmon.py.new').read())"
 mv /opt/portmon/portmon.py.new /opt/portmon/portmon.py; chmod 755 /opt/portmon/portmon.py
 for f in Vazirmatn-Regular.woff2 Vazirmatn-Medium.woff2; do fetch "fonts/$f" "/opt/portmon/fonts/$f"; done
+# The menu (`portmon`) and what it runs: kept here, so a new certificate or port needs no GitHub.
+for f in install.sh uninstall.sh cli.sh; do fetch "$f" "/opt/portmon/$f"; done
+chmod 755 /opt/portmon/install.sh /opt/portmon/uninstall.sh /opt/portmon/cli.sh
+ln -sfn /opt/portmon/cli.sh /usr/local/bin/portmon
 
 if [ ! -f /etc/portmon/key.pem ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes -subj "/CN=portmon" \
@@ -185,3 +202,4 @@ if [ -n "$DOMAIN" ]; then
 else
   echo "open https://<server-ip>:$PORT  (self-signed certificate: accept the browser warning once)"
 fi
+echo "manage it with: portmon  (update, SSL certificate, password, port, restart, status, logs, uninstall)"
