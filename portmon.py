@@ -36,7 +36,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "2.1"
+VERSION = "2.2"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -757,6 +757,7 @@ form{width:min(360px,100%);background:var(--card);border:1px solid var(--line);b
 h1{margin:0 0 16px;font-size:18px;line-height:1.3}label{font-size:13px;color:var(--t2)}input{height:40px}
 .err{color:var(--bad);font-size:13px;min-height:20px}.btn{height:40px}
 </style></head><body><form method="post" action="/login"><h1>{{TITLE}}</h1><label for="pw">رمز ورود</label>
+<input type="text" name="username" value="portmon" autocomplete="username" hidden>
 <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
 <div class="err" role="alert"><!--ERR--></div><button class="btn pri">ورود</button></form></body></html>"""
 
