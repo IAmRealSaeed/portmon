@@ -13,6 +13,10 @@ connections; kept 7 days). A port can belong to several groups; a group's total 
 "all ports" total counts each port once. The dashboard (stdlib HTTP server, optional TLS, password login) shows usage
 per group and port for any range, per-day/per-hour charts, live rates, server resources, and manages groups/ports.
 
+Beside the ports it keeps the main interface's own byte counts per hour and day ("server inbound"): what a provider
+that meters traffic sees, tunnels' overhead and unwatched ports included. And every interval it looks at who is
+connected to the listening ports: a port nobody watches that several addresses use is pointed out on the dashboard.
+
 Usage: portmon.py [--config /etc/portmon/config.json]      (python3 >= 3.8, stdlib only, needs `nft`)
        portmon.py --set-password                            (reads the password from stdin, stores a PBKDF2 hash)
 """
@@ -36,7 +40,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "2.3"
+VERSION = "2.4"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -47,7 +51,10 @@ LOCK = threading.Lock()
 CFG = {}
 LIVE = {"ts": 0, "interval": 60, "ports": {}}
 SYS = {"prev_cpu": None, "prev_net": None, "prev_ts": 0, "now": {}}
+SCAN = {"ts": 0, "ports": {}, "flagged": set()}   # listening port -> {conns, peers, process, unit} at the last look
 LOGIN_FAILS = {}
+PEER_MIN = 3   # a port that many distinct addresses use is someone's service, not a tunnel's own listener (1 far end)
+SSH_NAMES = {"sshd", "ssh", "dropbear"}
 
 
 # ------------------------------------------------------------------ config / time / auth
@@ -114,11 +121,21 @@ def init_db():
         CREATE TABLE IF NOT EXISTS sys_min (ts INTEGER PRIMARY KEY, cpu REAL, mem_used INTEGER, mem_total INTEGER,
             swap_used INTEGER, swap_total INTEGER, load1 REAL, net_rx REAL, net_tx REAL, disk_used INTEGER, disk_total INTEGER,
             tcp INTEGER, ct_count INTEGER, ct_max INTEGER);
+        CREATE TABLE IF NOT EXISTS nic_hour (hour TEXT PRIMARY KEY, rx INTEGER, tx INTEGER, secs REAL);
+        CREATE TABLE IF NOT EXISTS nic_day (day TEXT PRIMARY KEY, rx INTEGER, tx INTEGER, secs REAL);
+        CREATE TABLE IF NOT EXISTS nic_state (id INTEGER PRIMARY KEY CHECK (id = 1), boot TEXT, iface TEXT, rx INTEGER,
+            tx INTEGER, ts REAL);
+        CREATE TABLE IF NOT EXISTS seen_ports (port INTEGER PRIMARY KEY, conns INTEGER, peers INTEGER, process TEXT,
+            unit TEXT, first_seen INTEGER, last_seen INTEGER);
+        CREATE TABLE IF NOT EXISTS ignored_ports (port INTEGER PRIMARY KEY, at INTEGER);
         """)
         # v1 kept one group per port in ports.group_id: carry it over once
         if not c.execute("SELECT 1 FROM port_groups LIMIT 1").fetchone():
             c.execute("INSERT OR IGNORE INTO port_groups (port, group_id) SELECT port, group_id FROM ports WHERE group_id IS NOT NULL")
             c.execute("UPDATE ports SET group_id = NULL")
+        # first run of a version that keeps the interface's totals: rebuild them from the rates already sampled
+        if not c.execute("SELECT 1 FROM nic_day LIMIT 1").fetchone() and not c.execute("SELECT 1 FROM nic_state").fetchone():
+            nic_backfill(c)
 
 
 # ------------------------------------------------------------------ nftables
@@ -184,6 +201,56 @@ def read_int(path):
         return None
 
 
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def nic_add(c, t0, t1, rx, tx):
+    """Spread rx/tx bytes moved between t0 and t1 over the local hours (and days) they fall in, in proportion to
+    time, so a gap after a restart lands where it happened. Rounding never loses or invents a byte."""
+    span, t, done_rx, done_tx = t1 - t0, t0, 0, 0
+    while t < t1:
+        loc = local_now(t)
+        e = min(t1, t + 3600 - (loc.minute * 60 + loc.second + loc.microsecond / 1e6))
+        if e <= t:   # float edge at an exact boundary
+            e = min(t1, t + 1)
+        f = (e - t0) / span
+        prx, ptx = round(rx * f) - done_rx, round(tx * f) - done_tx
+        done_rx += prx
+        done_tx += ptx
+        hour, day = loc.strftime("%Y-%m-%d %H"), loc.strftime("%Y-%m-%d")
+        for tbl, key, val in (("nic_hour", "hour", hour), ("nic_day", "day", day)):
+            c.execute(f"INSERT INTO {tbl} ({key}, rx, tx, secs) VALUES (?, ?, ?, ?) ON CONFLICT({key}) DO UPDATE SET "
+                      f"rx = rx + excluded.rx, tx = tx + excluded.tx, secs = secs + excluded.secs", (val, prx, ptx, e - t))
+        t = e
+
+
+def nic_bank(iface, rx, tx, now, boot):
+    """Store the main interface's growth since the last reading. The reading is kept in the database, so restarting
+    portmon (an upgrade) loses nothing; a reboot, a counter that went back or another interface start a new baseline."""
+    with db() as c:
+        st = c.execute("SELECT boot, iface, rx, tx, ts FROM nic_state WHERE id = 1").fetchone()
+        c.execute("INSERT OR REPLACE INTO nic_state (id, boot, iface, rx, tx, ts) VALUES (1, ?, ?, ?, ?, ?)",
+                  (boot, iface, rx, tx, now))
+        if (st and st["boot"] == boot and st["iface"] == iface and rx >= st["rx"] and tx >= st["tx"]
+                and now > st["ts"]):
+            nic_add(c, st["ts"], now, rx - st["rx"], tx - st["tx"])
+
+
+def nic_backfill(c):
+    """Interface totals for the time before they were kept, from the per-sample rates (sys_min, 7 days)."""
+    prev = None
+    gap = 3 * max(60, int(CFG.get("interval", 60)))
+    for r in c.execute("SELECT ts, net_rx, net_tx FROM sys_min ORDER BY ts").fetchall():
+        if prev is not None and r["net_rx"] is not None and r["net_tx"] is not None and 0 < r["ts"] - prev <= gap:
+            nic_add(c, prev, r["ts"], r["net_rx"] * (r["ts"] - prev), r["net_tx"] * (r["ts"] - prev))
+        prev = r["ts"]
+
+
 def sys_sample():
     """One server sample (CPU% over the last interval, RAM, swap, load, main-interface rate, disk, connections)."""
     now = time.time()
@@ -216,6 +283,13 @@ def sys_sample():
         net_tx = max(0.0, (tx - SYS["prev_net"][2]) / el)
     SYS["prev_net"] = (iface, rx, tx) if rx is not None else None
     SYS["prev_ts"] = now
+    if rx is not None:
+        if "boot" not in SYS:
+            SYS["boot"] = boot_id()
+        try:
+            nic_bank(iface, rx, tx, now, SYS["boot"])
+        except sqlite3.Error as e:
+            print(f"nic: {e}", flush=True)
     st = os.statvfs("/")
     tcp = None
     try:
@@ -352,11 +426,13 @@ def prune():
     with db() as c:
         c.execute("DELETE FROM usage_min WHERE ts < ?", (cut_min,))
         c.execute("DELETE FROM usage_hour WHERE hour < ?", (cut_hour,))
+        c.execute("DELETE FROM nic_hour WHERE hour < ?", (cut_hour,))
         c.execute("DELETE FROM sys_min WHERE ts < ?", (int(time.time()) - 7 * 86400,))
+        c.execute("DELETE FROM seen_ports WHERE last_seen < ?", (int(time.time()) - 7 * 86400,))
 
 
 def collector():
-    for fn in (lambda: sample(rebuild=True), sys_sample):
+    for fn in (lambda: sample(rebuild=True), sys_sample, scan_ports):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — the loop below retries
@@ -364,7 +440,7 @@ def collector():
     n = 0
     while True:
         time.sleep(max(5, int(CFG["interval"])) - (time.time() % 1))
-        for fn in (sample, sys_sample):
+        for fn in (sample, sys_sample, scan_ports):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001 — keep counting whatever happens
@@ -395,7 +471,117 @@ def listening_ports():
         proc = re.search(r'\(\("([^"]+)"', line)
         e = seen.setdefault(port, {"port": port, "proto": set(), "process": proc.group(1) if proc else ""})
         e["proto"].add(parts[0])
-    return [dict(v, proto="/".join(sorted(v["proto"]))) for v in sorted(seen.values(), key=lambda x: x["port"])]
+    with db() as c:
+        ignored = {r["port"] for r in c.execute("SELECT port FROM ignored_ports")}
+    out = []
+    for v in sorted(seen.values(), key=lambda x: x["port"]):
+        s = SCAN["ports"].get(v["port"], {})
+        out.append(dict(v, proto="/".join(sorted(v["proto"])), conns=s.get("conns", 0), peers=s.get("peers", 0),
+                        unit=s.get("unit", ""), ignored=v["port"] in ignored))
+    return out
+
+
+def parse_listeners(text):
+    """`ss -Htlnp` -> {port: (process, pid)}: TCP listeners on public addresses (loopback ones serve no users)."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split()
+        m = re.search(r"^(.*):(\d+)$", parts[3]) if len(parts) > 3 else None
+        if not m or m.group(1).startswith("127.") or m.group(1) == "[::1]" or "%lo" in m.group(1):
+            continue
+        proc = re.search(r'\(\("([^"]+)",pid=(\d+)', line)
+        out.setdefault(int(m.group(2)), (proc.group(1), int(proc.group(2))) if proc else ("", None))
+    return out
+
+
+def parse_established(text, ports):
+    """`ss -Htn state established` -> {local port: (connections, distinct peer addresses)} for the given ports."""
+    conns, peers = {}, {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            lp = int(parts[2].rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if lp not in ports:
+            continue
+        ip = parts[3].rsplit(":", 1)[0].strip("[]")
+        ip = ip[7:] if ip.startswith("::ffff:") else ip
+        conns[lp] = conns.get(lp, 0) + 1
+        peers.setdefault(lp, set()).add(ip)
+    return {p: (n, len(peers[p])) for p, n in conns.items()}
+
+
+def unit_of(pid):
+    """The systemd service a process runs in: tunnel tools often rename their process, the unit keeps its name."""
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            m = re.search(r"/([^/\s]+)\.service", f.read())
+        return m.group(1) if m else ""
+    except (OSError, TypeError):
+        return ""
+
+
+def scan_ports():
+    """Who is connected to the listening ports now. A port nobody watches that PEER_MIN or more addresses use is
+    remembered in seen_ports with what it had at the last look, so the dashboard can point at it while it is quiet
+    too. A tunnel's own listener has one far end and is never flagged; neither is SSH, which scanners crowd."""
+    run = lambda *a: subprocess.run(list(a), capture_output=True, text=True).stdout
+    try:
+        lis = parse_listeners(run("ss", "-Htlnp"))
+        est = parse_established(run("ss", "-Htn", "state", "established"), set(lis))
+    except OSError:
+        return
+    now = int(time.time())
+    info = {}
+    for port, (proc, pid) in lis.items():
+        n, peers = est.get(port, (0, 0))
+        info[port] = {"conns": n, "peers": peers, "process": proc, "unit": unit_of(pid) if pid else ""}
+    watched, flagged = set(watched_ports()), set()
+    with db() as c:
+        for port, i in info.items():
+            if (port in watched or port == int(CFG["port"]) or i["peers"] < PEER_MIN
+                    or i["process"] in SSH_NAMES or i["unit"] in SSH_NAMES):
+                continue
+            flagged.add(port)
+            c.execute("INSERT INTO seen_ports (port, conns, peers, process, unit, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                      "ON CONFLICT(port) DO UPDATE SET conns = excluded.conns, peers = excluded.peers, "
+                      "process = excluded.process, unit = excluded.unit, last_seen = excluded.last_seen",
+                      (port, i["conns"], i["peers"], i["process"], i["unit"], now, now))
+    SCAN.update(ts=now, ports=info, flagged=flagged)
+
+
+def unwatched(hours=24):
+    """Ports someone used in the last `hours` that nobody watches and nobody chose to ignore, busiest first."""
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT port, conns, peers, process, unit, first_seen, last_seen FROM seen_ports WHERE last_seen >= ? "
+            "AND port NOT IN (SELECT port FROM ports) AND port NOT IN (SELECT port FROM ignored_ports) "
+            "ORDER BY peers DESC, port", (int(time.time()) - hours * 3600,))]
+    for r in rows:
+        r["active"] = r["port"] in SCAN.get("flagged", ())   # busy at the last look, not only earlier
+    return rows
+
+
+def day_start(day):
+    """Epoch of a local day's first second."""
+    off = dt.timedelta(minutes=int(CFG.get("utc_offset_minutes", 210)))
+    return (dt.datetime.fromisoformat(day).replace(tzinfo=dt.timezone.utc) - off).timestamp()
+
+
+def nic_report(day_from, day_to):
+    """The main interface's bytes over a range of days, and whether all of the range (up to now) was counted."""
+    with db() as c:
+        r = c.execute("SELECT COALESCE(SUM(rx), 0) AS rx, COALESCE(SUM(tx), 0) AS tx, COALESCE(SUM(secs), 0) AS secs "
+                      "FROM nic_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchone()
+        first = c.execute("SELECT MIN(day) AS d FROM nic_day").fetchone()["d"]
+    start, end = day_start(day_from), min(time.time(), day_start(day_to) + 86400)
+    want = max(0.0, end - start)
+    missing = want - r["secs"]
+    return {"rx": r["rx"], "tx": r["tx"], "since": first,
+            "partial": bool(want) and missing > max(3 * max(60, int(CFG.get("interval", 60))), 0.02 * want)}
 
 
 def layout():
@@ -423,6 +609,8 @@ def report(day_from, day_to, group=None):
     in_scope = set(scope_ports(ports, group))
     with db() as c:
         rows = c.execute("SELECT day, port, rx, tx FROM usage_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchall()
+        nic_days = {r["day"]: r["rx"] for r in c.execute("SELECT day, rx FROM nic_day WHERE day BETWEEN ? AND ?",
+                                                         (day_from, day_to))}
     per_port, per_day = {}, {}
     for r in rows:
         a = per_port.setdefault(r["port"], [0, 0])
@@ -442,11 +630,12 @@ def report(day_from, day_to, group=None):
     for i in range((d1 - d0).days + 1):
         d = (d0 + dt.timedelta(days=i)).isoformat()
         pd = per_day.get(d, {})
-        days.append(series_point(d, pd, in_scope, groups, ports))
+        days.append(dict(series_point(d, pd, in_scope, groups, ports), nic=nic_days.get(d)))
     tot_rx = sum(port_rows[p]["rx"] for p in in_scope)
     tot_tx = sum(port_rows[p]["tx"] for p in in_scope)
     return {"from": day_from, "to": day_to, "scope": group or "all", "groups": out_groups, "ports": list(port_rows.values()),
             "ungrouped": ungrouped, "days": days, "total": {"rx": tot_rx, "tx": tot_tx},
+            "nic": nic_report(day_from, day_to), "unwatched": unwatched(),
             "live": {"rx_bps": sum(live.get(p, {}).get("rx_bps", 0) for p in in_scope),
                      "tx_bps": sum(live.get(p, {}).get("tx_bps", 0) for p in in_scope), "interval": LIVE["interval"],
                      "ts": LIVE["ts"]}}
@@ -468,10 +657,12 @@ def hourly(day, group=None):
     in_scope = set(scope_ports(ports, group))
     with db() as c:
         rows = c.execute("SELECT hour, port, rx, tx FROM usage_hour WHERE hour LIKE ?", (day + " %",)).fetchall()
+        nic_hours = {r["hour"][-2:]: r["rx"] for r in c.execute("SELECT hour, rx FROM nic_hour WHERE hour LIKE ?", (day + " %",))}
     per_hour = {f"{h:02d}": {} for h in range(24)}
     for r in rows:
         per_hour[r["hour"][-2:]][r["port"]] = (r["rx"], r["tx"])
-    return {"day": day, "hours": [series_point(h, pp, in_scope, groups, ports) for h, pp in per_hour.items()]}
+    return {"day": day, "hours": [dict(series_point(h, pp, in_scope, groups, ports), nic=nic_hours.get(h))
+                                  for h, pp in per_hour.items()]}
 
 
 # ------------------------------------------------------------------ changes
@@ -505,6 +696,13 @@ def change_port(b):
         raise ValueError("شمارهٔ پورت درست نیست.")
     gids = sorted({int(x) for x in (b.get("groups") or []) if str(x).strip().isdigit()})
     rebuild = False
+    if act in ("ignore", "unignore"):   # the dashboard's «unwatched port» notice for this port: hide it / bring it back
+        with db() as c:
+            if act == "ignore":
+                c.execute("INSERT OR REPLACE INTO ignored_ports (port, at) VALUES (?, ?)", (port, int(time.time())))
+            else:
+                c.execute("DELETE FROM ignored_ports WHERE port = ?", (port,))
+        return {"ok": True}
     if act == "delete":
         sample()   # bank what this port counted since the last sample before it leaves the table
     with db() as c:
@@ -785,7 +983,12 @@ section{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;min-width:0}
 .chip:hover{color:var(--t1);background:var(--hover)}.chip.on{background:var(--raised);border-color:var(--line2);color:var(--t1)}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
 .q{display:inline-flex;align-items:baseline;gap:4px;white-space:nowrap}.q small{font-size:12px;color:var(--t3)}
-.kpis,.cards{display:grid;gap:12px}.kpis{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.4fr)}.cards{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.kpis,.cards{display:grid;gap:12px}.kpis{grid-template-columns:minmax(0,1.3fr) repeat(3,minmax(0,1fr)) minmax(0,1.3fr)}.cards{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.alerts{display:grid;gap:8px}.alerts:empty{display:none}
+.alert{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 16px;border-radius:12px;
+  border:1px solid color-mix(in srgb,var(--warn) 35%,var(--line));background:color-mix(in srgb,var(--warn) 7%,var(--card))}
+.alert>.ic{color:var(--warn);flex:none}.alert .txt{flex:1;min-width:220px;display:grid;gap:2px}
+.alert .txt b{font-size:14px}.alert .txt span{font-size:12px;color:var(--t2)}.alert .acts{display:flex;gap:8px}
 .kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 20px;min-width:0}
 .kpi .k{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
 .kpi .v{display:flex;align-items:baseline;gap:8px;margin-top:8px;font-size:28px;line-height:1.2;font-weight:500;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -857,10 +1060,12 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
   <div class="custom"><label for="from">از</label><input type="date" id="from"><label for="to">تا</label><input type="date" id="to"><button class="btn" id="apply">نمایش</button></div>
  </div>
  <div class="scopes" id="scopes"></div>
+ <div class="alerts" id="unw" role="status"></div>
  <div class="kpis">
   <div class="kpi main"><div class="k">مجموع</div><div class="v" id="c_tot">—</div><div class="s" id="c_tot_s"></div></div>
   <div class="kpi"><div class="k">دانلود کاربران</div><div class="v" id="c_tx">—</div></div>
   <div class="kpi"><div class="k">آپلود کاربران</div><div class="v" id="c_rx">—</div></div>
+  <div class="kpi" title="هرچه کارت شبکهٔ سرور گرفته: همهٔ پورت‌ها و تونل‌ها، با سربارشان. دیتاسنتری که فقط ورودی را می‌شمارد همین را حساب می‌کند."><div class="k">ورودی سرور</div><div class="v" id="c_nic">—</div><div class="s" id="c_nic_s"></div></div>
   <div class="kpi"><div class="k"><i class="led" id="led"></i>سرعت همین الان</div><div class="v" id="c_live">—</div><div class="s" id="c_live_s"></div></div>
  </div>
  <div class="panel"><div class="ph"><div><h2 id="chart_title">مصرف روزانه</h2><span class="sub" id="range_lbl"></span></div><div class="legend" id="legend"></div></div><div class="chart" id="chart"></div></div>
@@ -901,8 +1106,10 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const fa=(n,d)=>Number(n).toLocaleString('fa-IR',d==null?undefined:{maximumFractionDigits:d});
+const fp=p=>Number(p).toLocaleString('fa-IR',{useGrouping:false});   /* a port number, never «۲٬۰۹۳» */
 const IC={chev:'<path d="m15 18-6-6 6-6"/>',pen:'<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>',
-  down:'<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',up:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>'};
+  down:'<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',up:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
+  warn:'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>'};
 const ico=(k,s)=>`<svg class="ic" viewBox="0 0 24 24" width="${s||16}" height="${s||16}" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[k]}</svg>`;
 function unit(b){const u=['بایت','KB','MB','GB','TB','PB'];let i=0;b=Number(b)||0;while(b>=1024&&i<u.length-1){b/=1024;i++}
   return [b.toLocaleString('fa-IR',{maximumFractionDigits:(b>=100||i==0)?0:(b>=10?1:2)}),u[i]]}
@@ -953,6 +1160,11 @@ async function load(){
   $('#c_live').innerHTML=ico('down',18)+QR(R.live.tx_bps);
   $('#c_live_s').innerHTML=`${ico('up',12)} ${rate(R.live.rx_bps)} آپلود`;
   led($('#led'),R.live.ts,R.live.interval);
+  const N=R.nic;
+  $('#c_nic').innerHTML=N.since?QB(N.rx):'—';
+  $('#c_nic_s').innerHTML=!N.since?'از چند دقیقهٔ دیگر':(SCOPE=='all'?'':'کل سرور · ')+`خروجی ${nb(N.tx)}`
+    +(N.partial?(N.since>f?` · ثبت از ${jal(N.since)}`:' · بخشی از بازه ثبت نشده'):'');
+  renderUnwatched(R.unwatched);
   $('#range_lbl').textContent=jalRange(f,t);
   renderTable(R);
   if(f==t){const H=await api(`/api/hourly?day=${f}${sq}`);$('#chart_title').textContent='مصرف ساعتی';
@@ -960,12 +1172,24 @@ async function load(){
   else{$('#chart_title').textContent='مصرف روزانه';
     drawUsage(R.days.map(x=>({lbl:x.key==CFG.today?'امروز':jal(x.key),full:jalFull(x.key)+(x.key==CFG.today?'، تا این لحظه':''),now:x.key==CFG.today,...x})))}
 }
+function ago(ts){const m=Math.max(1,Math.round((Date.now()/1000-ts)/60));return m<60?`${fa(m)} دقیقه پیش`:`${fa(Math.round(m/60))} ساعت پیش`}
+/* a port someone uses that nobody watches: its traffic reaches the provider's meter but not this page */
+function renderUnwatched(list){
+  $('#unw').innerHTML=(list||[]).map(u=>`<div class="alert">${ico('warn',20)}<div class="txt"><b>پورت ${fp(u.port)} کاربر دارد ولی زیر نظر نیست</b>`
+    +`<span>${u.active?'الان':ago(u.last_seen)+':'} ${fa(u.conns)} اتصال از ${fa(u.peers)} آی‌پی${u.unit?` · سرویس ${esc(u.unit)}`:u.process?` · برنامهٔ ${esc(u.process)}`:''} · ترافیکش در آمار این صفحه نیست</span></div>`
+    +`<div class="acts"><button class="btn sm pri" data-ua="${u.port}" data-ul="${esc(u.unit)}">زیر نظر بگیر</button><button class="btn sm" data-ui="${u.port}">نادیده بگیر</button></div></div>`).join('');
+  $$('#unw [data-ua]').forEach(b=>b.onclick=()=>pick(b.dataset.ua,b.dataset.ul));
+  $$('#unw [data-ui]').forEach(b=>b.onclick=()=>act('/api/port',{action:'ignore',port:b.dataset.ui}));
+}
+function pick(port,unit){$('[data-tab="mgr"]').click();$('#p_port').value=port;
+  if(unit&&!$('#p_label').value)$('#p_label').value='سرویس '+unit;
+  scrollTo({top:0,behavior:'smooth'});toast('گروهش را انتخاب کنید و «افزودن پورت» را بزنید')}
 function renderTable(R){
   const P={};R.ports.forEach(p=>P[p.port]=p);
   const scopeTot=(R.total.rx+R.total.tx)||1;let h='';
   const share=(v,c)=>`<span class="share"><span class="bar"><i style="width:${Math.max(2,Math.round(100*v/scopeTot))}%;background:${c}"></i></span>${fa(Math.round(100*v/scopeTot))}٪</span>`;
   const portRow=(p,gid,color)=>{const pt=p.rx+p.tx;const others=p.groups.filter(x=>String(x)!==String(gid));
-    return `<tr class="p ${OPEN.has(String(gid))||SCOPE!='all'?'':'hide'}" data-pg="${gid}"><td><span class="pp">پورت ${fa(p.port)}${others.map(o=>`<i class="dot" title="${esc((G(o)||{}).name)}" style="background:${gColor(o)}"></i>`).join('')}</span>`
+    return `<tr class="p ${OPEN.has(String(gid))||SCOPE!='all'?'':'hide'}" data-pg="${gid}"><td><span class="pp">پورت ${fp(p.port)}${others.map(o=>`<i class="dot" title="${esc((G(o)||{}).name)}" style="background:${gColor(o)}"></i>`).join('')}</span>`
       +`<span class="desc ${p.label?'':'empty'}" data-ed="${p.port}">${p.label?esc(p.label):'افزودن توضیح'}${ico('pen',12)}</span></td>`
       +`<td>${QB(p.tx)}</td><td>${QB(p.rx)}</td><td>${QB(pt)}</td><td>${share(pt,color)}</td><td class="dim">${rate(p.live.rx_bps+p.live.tx_bps)}</td></tr>`};
   const groupRow=(gid,name,color,n,tx,rx,live)=>`<tr class="g ${OPEN.has(gid)?'open':''}" data-g="${gid}"><td><span class="gn">${ico('chev')}<i class="dot" style="background:${color}"></i>${name}<span class="cnt">${fa(n)} پورت</span></span></td>`
@@ -1006,8 +1230,9 @@ function drawUsage(items){
   const hov=$('#hov');
   $$('#chart .hit').forEach(r=>{r.onmousemove=e=>{const it=items[r.dataset.i];hov.setAttribute('x',r.getAttribute('x'));hov.setAttribute('opacity','.05');
     let h=`<b>${it.full}</b><div class="r"><span>مجموع</span>${bytes(it.total)}</div>`;
+    if(it.nic!=null)h+=`<div class="r"><span>ورودی سرور</span>${bytes(it.nic)}</div>`;
     if(multi)h+=CFG.groups.filter(g=>it.groups[String(g.id)]).map(g=>`<div class="r"><span><i class="dot" style="background:${g.color}"></i>${esc(g.name)}</span>${bytes(it.groups[String(g.id)])}</div>`).join('');
-    if(it.top&&it.top.length)h+='<div class="hd">پرمصرف‌ها</div>'+it.top.map(([p,v])=>`<div class="r"><span>پورت ${fa(p)}${pLabel(p)?' · '+esc(pLabel(p)).slice(0,28):''}</span>${bytes(v)}</div>`).join('');
+    if(it.top&&it.top.length)h+='<div class="hd">پرمصرف‌ها</div>'+it.top.map(([p,v])=>`<div class="r"><span>پورت ${fp(p)}${pLabel(p)?' · '+esc(pLabel(p)).slice(0,28):''}</span>${bytes(v)}</div>`).join('');
     tipAt(e,h)};r.onmouseleave=()=>{tipOff();hov.setAttribute('opacity','0')}})
 }
 
@@ -1055,9 +1280,13 @@ function gsel(sel,name){return CFG.groups.map(g=>`<label class="${sel.includes(g
 function renderMgr(){
   $('#glist').innerHTML=CFG.groups.map(g=>`<div class="row"><input type="color" value="${g.color}" data-gc="${g.id}" aria-label="رنگ ${esc(g.name)}"><input class="grow" value="${esc(g.name)}" data-gn="${g.id}" aria-label="نام گروه"><span class="meta">${fa(CFG.ports.filter(p=>p.groups.includes(g.id)).length)} پورت</span><button class="btn del sm" data-gd="${g.id}">حذف</button></div>`).join('')||'<div class="row meta">گروهی نیست</div>';
   $('#p_groups').innerHTML=gsel([],'ng');
-  $('#plist').innerHTML=CFG.ports.map(p=>`<div class="prow"><span class="num">${fa(p.port)}</span><div><textarea data-pl="${p.port}" placeholder="توضیح این پورت" aria-label="توضیح پورت ${p.port}">${esc(p.label||'')}</textarea><div class="gsel">${gsel(p.groups,'pg-'+p.port)}</div></div><button class="btn del sm" data-pd="${p.port}">حذف</button></div>`).join('')||'<div class="row meta">پورتی زیر نظر نیست</div>';
+  $('#plist').innerHTML=CFG.ports.map(p=>`<div class="prow"><span class="num">${fp(p.port)}</span><div><textarea data-pl="${p.port}" placeholder="توضیح این پورت" aria-label="توضیح پورت ${p.port}">${esc(p.label||'')}</textarea><div class="gsel">${gsel(p.groups,'pg-'+p.port)}</div></div><button class="btn del sm" data-pd="${p.port}">حذف</button></div>`).join('')||'<div class="row meta">پورتی زیر نظر نیست</div>';
   const watched=new Set(CFG.ports.map(p=>p.port));
-  $('#llist').innerHTML=CFG.listening.filter(l=>l.port!==CFG.dashboard_port).map(l=>`<div class="row"><span class="num">${fa(l.port)}</span><span class="meta grow">${l.proto} · ${esc(l.process)}</span>${watched.has(l.port)?'<span class="meta">زیر نظر است</span>':`<button class="btn sm" data-la="${l.port}">انتخاب</button>`}</div>`).join('');
+  $('#llist').innerHTML=CFG.listening.filter(l=>l.port!==CFG.dashboard_port).map(l=>`<div class="row"><span class="num">${fp(l.port)}</span>`
+    +`<span class="meta grow">${l.proto} · ${esc(l.unit?'سرویس '+l.unit:l.process)}${l.conns?` · ${fa(l.conns)} اتصال از ${fa(l.peers)} آی‌پی`:''}</span>`
+    +(watched.has(l.port)?'<span class="meta">زیر نظر است</span>'
+      :(l.ignored?`<span class="meta">هشدارش خاموش است</span><button class="btn sm" data-uu="${l.port}">روشن کن</button>`:'')
+       +`<button class="btn sm" data-la="${l.port}" data-ll="${esc(l.unit)}">انتخاب</button>`)+'</div>').join('');
   $$('[data-gn]').forEach(e=>e.onchange=()=>act('/api/group',{action:'edit',id:e.dataset.gn,name:e.value}));
   $$('[data-gc]').forEach(e=>e.onchange=()=>act('/api/group',{action:'edit',id:e.dataset.gc,color:e.value}));
   $$('[data-gd]').forEach(e=>e.onclick=()=>confirm('گروه حذف شود؟ پورت‌ها و آمارشان می‌مانند.')&&act('/api/group',{action:'delete',id:e.dataset.gd}));
@@ -1065,7 +1294,8 @@ function renderMgr(){
   CFG.ports.forEach(p=>$$(`[data-pg-${p.port}]`).forEach(cb=>cb.onchange=()=>{cb.closest('label').classList.toggle('on',cb.checked);act('/api/port',{action:'edit',port:p.port,groups:$$(`[data-pg-${p.port}]`).filter(x=>x.checked).map(x=>x.getAttribute(`data-pg-${p.port}`))})}));
   $$('[data-ng]').forEach(cb=>cb.onchange=()=>cb.closest('label').classList.toggle('on',cb.checked));
   $$('[data-pd]').forEach(e=>e.onclick=()=>{const p=e.dataset.pd;if(!confirm(`پورت ${p} از زیر نظر خارج شود؟`))return;const purge=confirm('آمار قبلی این پورت هم پاک شود؟ (انصراف = آمار بماند)');act('/api/port',{action:'delete',port:p,purge})});
-  $$('[data-la]').forEach(e=>e.onclick=()=>{$('#p_port').value=e.dataset.la;$('#p_label').focus();scrollTo({top:0,behavior:'smooth'})});
+  $$('[data-la]').forEach(e=>e.onclick=()=>{$('#p_port').value=e.dataset.la;if(e.dataset.ll&&!$('#p_label').value)$('#p_label').value='سرویس '+e.dataset.ll;$('#p_label').focus();scrollTo({top:0,behavior:'smooth'})});
+  $$('[data-uu]').forEach(e=>e.onclick=()=>act('/api/port',{action:'unignore',port:e.dataset.uu}));
 }
 async function act(p,b){try{await api(p,b);toast('ذخیره شد');await loadCfg();await load()}catch(e){if(e)toast(e.message)}}
 $('#g_add').onclick=()=>{const n=$('#g_name').value.trim();if(!n)return;act('/api/group',{action:'add',name:n,color:$('#g_color').value});$('#g_name').value=''};
