@@ -40,7 +40,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "2.4"
+VERSION = "2.4.1"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -1107,6 +1107,8 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const fa=(n,d)=>Number(n).toLocaleString('fa-IR',d==null?undefined:{maximumFractionDigits:d});
 const fp=p=>Number(p).toLocaleString('fa-IR',{useGrouping:false});   /* a port number, never «۲٬۰۹۳» */
+/* chart labels sit in an LTR drawing; an RTL isolate orders them as the page does: «GB ۱۰۰», «آبان ۵» */
+const rl=t=>'\u2067'+t+'\u2069';
 const IC={chev:'<path d="m15 18-6-6 6-6"/>',pen:'<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>',
   down:'<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',up:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
   warn:'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>'};
@@ -1216,7 +1218,7 @@ function drawUsage(items){
   let s=`<svg class="plot" viewBox="0 0 ${W} ${H}" height="${H}" role="img" aria-label="${esc($('#chart_title').textContent)}">`
     +`<defs><pattern id="now" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" stroke="${col}" stroke-width="2"/></pattern></defs>`
     +`<rect id="hov" y="${pt}" height="${H-pt-pb}" width="${bw}" fill="var(--t1)" opacity="0" rx="4"/>`;
-  for(let i=0;i<=4;i++){const v=nice*i;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line${i?'':'2'})"/><text x="${W-pr+12}" y="${y(v)+4}">${bytes(v)}</text>`}
+  for(let i=0;i<=4;i++){const v=nice*i;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line${i?'':'2'})"/><text x="${W-pr+12}" y="${y(v)+4}">${rl(bytes(v))}</text>`}
   const op=multi?.12:1;
   s+=items.map((it,i)=>`<rect x="${xc(i)-barW/2}" y="${y(it.total)}" width="${barW}" height="${Math.max(0,y(0)-y(it.total))}" fill="${it.now?'url(#now)':col}" opacity="${it.now?op*1.6:op}" rx="2"/>`).join('');
   if(multi)for(const g of CFG.groups){const pts=items.map((it,i)=>`${xc(i)},${y(it.groups[String(g.id)]||0)}`);
@@ -1224,7 +1226,7 @@ function drawUsage(items){
     if(n<=31)s+=items.map((it,i)=>`<circle cx="${xc(i)}" cy="${y(it.groups[String(g.id)]||0)}" r="3" fill="${g.color}" stroke="var(--card)" stroke-width="1.5"/>`).join('')}
   const every=Math.ceil(n/Math.max(4,Math.floor(W/64)));
   items.forEach((it,i)=>{s+=`<rect class="hit" data-i="${i}" x="${xc(i)-bw/2}" y="${pt}" width="${bw}" height="${H-pt-pb}" fill="transparent"/>`;
-    if(i%every==0||it.now)s+=`<text x="${xc(i)}" y="${H-8}" text-anchor="middle"${it.now?' style="fill:var(--t1)"':''}>${it.lbl}</text>`});
+    if(i%every==0||it.now)s+=`<text x="${xc(i)}" y="${H-8}" text-anchor="middle"${it.now?' style="fill:var(--t1)"':''}>${rl(it.lbl)}</text>`});
   $('#chart').innerHTML=s+'</svg>';
   $('#legend').innerHTML=multi?CFG.groups.map(g=>`<span><i class="dot" style="background:${g.color}"></i>${esc(g.name)}</span>`).join('')+`<span><i class="dot" style="background:var(--t1);opacity:.25"></i>کل، هر پورت یک بار</span>`:'';
   const hov=$('#hov');
@@ -1246,11 +1248,11 @@ function lineChart(el,hist,series,fmt,maxFixed,H){
   const t0=pts[0].ts,t1=pts[pts.length-1].ts||t0+1,x=ts=>W-pr-(W-pl-pr)*(t1==t0?0:(ts-t0)/(t1-t0));
   const max=maxFixed||Math.max(1e-9,...pts.flatMap(h=>series.map(s=>h[s.k]||0)))*1.15,y=v=>pt+(H-pt-pb)*(1-v/max);
   let s=`<svg class="plot" viewBox="0 0 ${W} ${H}" height="${H}">`;
-  for(let i=0;i<=4;i++){const v=max*i/4;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line${i?'':'2'})"/>${i%2==0?`<text x="${W-pr+12}" y="${y(v)+4}">${fmt(v)}</text>`:''}`}
+  for(let i=0;i<=4;i++){const v=max*i/4;s+=`<line x1="${pl}" x2="${W-pr}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line${i?'':'2'})"/>${i%2==0?`<text x="${W-pr+12}" y="${y(v)+4}">${rl(fmt(v))}</text>`:''}`}
   for(const se of series){const line=pts.map(h=>`${x(h.ts)},${y(h[se.k]||0)}`).join(' ');
     s+=`<polygon points="${x(t0)},${y(0)} ${line} ${x(t1)},${y(0)}" fill="${se.c}" opacity=".08"/><polyline points="${line}" fill="none" stroke="${se.c}" stroke-width="1.75" stroke-linejoin="round"/>`}
   const long=HOURS>24;
-  for(let i=0;i<4;i++){const ts=t0+(t1-t0)*i/3;s+=`<text x="${x(ts)}" y="${H-8}" text-anchor="${i==0?'end':i==3?'start':'middle'}">${clock(ts,long?{month:'short',day:'numeric'}:{})}</text>`}
+  for(let i=0;i<4;i++){const ts=t0+(t1-t0)*i/3;s+=`<text x="${x(ts)}" y="${H-8}" text-anchor="${i==0?'end':i==3?'start':'middle'}">${rl(clock(ts,long?{month:'short',day:'numeric'}:{}))}</text>`}
   $(el).innerHTML=s+'</svg>';
 }
 function card(k,v,s,pct,lit){const tone=pct==null?'':pct>90?'bad':pct>70?'warn':'';

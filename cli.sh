@@ -27,19 +27,37 @@ cert_line() {
   else echo "${Y}self-signed${N}: the browser warns and Chrome will not save the password (menu 2 fixes that)"; fi
 }
 installed() { [ -f "$APP/install.sh" ] || { echo "$APP/install.sh is missing: run «portmon update» to get it back"; exit 1; }; }
+# the same download bar as the installer's (install.sh draws the rest of the files)
+draw() {
+  local w=28 f i bar=""
+  f=$(( $2 * w / 100 ))
+  for ((i = 0; i < w; i++)); do if [ "$i" -lt "$f" ]; then bar+="#"; else bar+="."; fi; done
+  printf '\r  %-24s [%s] %3d%%' "$1" "$bar" "$2" >&2
+}
+download() {  # download <url> <file> <label>
+  [ -t 2 ] || { curl -fsSL "$1" -o "$2"; return; }
+  local tok rc
+  draw "$3" 0
+  curl -fL --progress-bar "$1" -o "$2" 2>&1 | while IFS= read -r -d $'\r' tok || [ -n "$tok" ]; do
+    if [[ $tok =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then draw "$3" "${BASH_REMATCH[1]}"; fi
+  done
+  rc=${PIPESTATUS[0]}
+  if [ "$rc" = 0 ]; then draw "$3" 100; printf '  %s KB\n' "$(( ($(stat -c %s "$2") + 1023) / 1024 ))" >&2; else printf '\n' >&2; fi
+  return "$rc"
+}
 
 do_update() {
   local dir rc
   dir=$(mktemp -d) || exit 1
-  echo "downloading the latest portmon ..."
-  if ! curl -fsSL "$REPO_RAW/install.sh" -o "$dir/install.sh"; then
+  echo "downloading from GitHub:"
+  if ! download "$REPO_RAW/install.sh" "$dir/install.sh" install.sh; then
     rm -rf "$dir"
     echo "${R}GitHub is not reachable from this server.${N} Take install_portmon.sh from"
     echo "https://github.com/IAmRealSaeed/portmon/releases/latest, copy it here and run: bash install_portmon.sh"
     exit 1
   fi
   # From an empty folder, so the installer downloads everything else rather than look beside itself.
-  PM_SRC='' bash "$dir/install.sh"; rc=$?
+  PM_SRC='' PM_DL_HEADED=1 bash "$dir/install.sh"; rc=$?
   rm -rf "$dir"
   exit $rc
 }

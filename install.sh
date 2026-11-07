@@ -22,7 +22,31 @@ if [ -z "${PM_SRC:-}" ] && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BA
   PM_SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fi
 
+# On a terminal every download draws a bar (name, how far, how big) and every package says it is being installed;
+# piped into a log it all stays quiet, as before.
+TTY=0; [ -t 2 ] && TTY=1
+draw() {  # draw <label> <percent>
+  local w=28 f i bar=""
+  f=$(( $2 * w / 100 ))
+  for ((i = 0; i < w; i++)); do if [ "$i" -lt "$f" ]; then bar+="#"; else bar+="."; fi; done
+  printf '\r  %-24s [%s] %3d%%' "$1" "$bar" "$2" >&2
+}
+human() { local b; b=$(stat -c %s "$1" 2>/dev/null || echo 0); if [ "$b" -ge 1048576 ]; then echo "$((b / 1048576)) MB"; else echo "$(( (b + 1023) / 1024 )) KB"; fi; }
+download() {  # download <url> <file> <label>
+  if [ "$TTY" != 1 ]; then curl -fsSL "$1" -o "$2"; return; fi
+  local tok rc
+  draw "$3" 0
+  # curl redraws its own bar with \r; only its percentage is taken, and drawn beside the file's name
+  curl -fL --progress-bar "$1" -o "$2" 2>&1 | while IFS= read -r -d $'\r' tok || [ -n "$tok" ]; do
+    if [[ $tok =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then draw "$3" "${BASH_REMATCH[1]}"; fi
+  done
+  rc=${PIPESTATUS[0]}
+  if [ "$rc" = 0 ]; then draw "$3" 100; printf '  %s\n' "$(human "$2")" >&2; else printf '  failed (curl %s)\n' "$rc" >&2; fi
+  return "$rc"
+}
+
 apt_install() {
+  [ "$TTY" = 1 ] && echo "installing $* ..." >&2
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1 || {
     apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null; }
 }
@@ -96,10 +120,11 @@ fetch() {  # fetch <path in repo> <destination>
     [ "$PM_SRC/$1" -ef "$2" ] && return 0
     cp "$PM_SRC/$1" "$2.new"
   else
-    curl -fsSL "$REPO_RAW/$1" -o "$2.new"
+    download "$REPO_RAW/$1" "$2.new" "$(basename "$1")"
   fi
   mv -f "$2.new" "$2"
 }
+[ -z "${PM_SRC:-}" ] && [ "$TTY" = 1 ] && [ -z "${PM_DL_HEADED:-}" ] && echo "downloading from GitHub:" >&2   # the menu printed it
 fetch portmon.py /opt/portmon/portmon.py.new
 python3 -c "import ast,sys; ast.parse(open('/opt/portmon/portmon.py.new').read())"
 mv /opt/portmon/portmon.py.new /opt/portmon/portmon.py; chmod 755 /opt/portmon/portmon.py
