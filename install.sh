@@ -32,13 +32,17 @@ draw() {  # draw <label> <percent>
   printf '\r  %-24s [%s] %3d%%' "$1" "$bar" "$2" >&2
 }
 human() { local b; b=$(stat -c %s "$1" 2>/dev/null || echo 0); if [ "$b" -ge 1048576 ]; then echo "$((b / 1048576)) MB"; else echo "$(( (b + 1023) / 1024 )) KB"; fi; }
+# Some links (Iran's to raw.githubusercontent.com among them) now and then hold a connection open and send nothing.
+# Without limits curl waits for ever; with these, a try that brings no byte for 15 s is dropped and tried again.
+NET=(--connect-timeout 15 --speed-limit 1 --speed-time 15 --max-time 180 --retry 4 --retry-delay 1)
 download() {  # download <url> <file> <label>
-  if [ "$TTY" != 1 ]; then curl -fsSL "$1" -o "$2"; return; fi
+  if [ "$TTY" != 1 ]; then curl -fsSL "${NET[@]}" "$1" -o "$2"; return; fi
   local tok rc
   draw "$3" 0
   # curl redraws its own bar with \r; only its percentage is taken, and drawn beside the file's name
-  curl -fL --progress-bar "$1" -o "$2" 2>&1 | while IFS= read -r -d $'\r' tok || [ -n "$tok" ]; do
-    if [[ $tok =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then draw "$3" "${BASH_REMATCH[1]}"; fi
+  curl -fL --progress-bar "${NET[@]}" "$1" -o "$2" 2>&1 | while IFS= read -r -d $'\r' tok || [ -n "$tok" ]; do
+    if [[ $tok == *"Will retry"* ]]; then printf '\r  %-24s %-36s' "$3" "no answer, trying again ..." >&2
+    elif [[ $tok =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then draw "$3" "${BASH_REMATCH[1]}"; fi
   done
   rc=${PIPESTATUS[0]}
   if [ "$rc" = 0 ]; then draw "$3" 100; printf '  %s\n' "$(human "$2")" >&2; else printf '  failed (curl %s)\n' "$rc" >&2; fi
@@ -120,9 +124,24 @@ fetch() {  # fetch <path in repo> <destination>
     [ "$PM_SRC/$1" -ef "$2" ] && return 0
     cp "$PM_SRC/$1" "$2.new"
   else
-    download "$REPO_RAW/$1" "$2.new" "$(basename "$1")"
+    download "$REPO_RAW/$1" "$2.new" "$(basename "$1")" || { rm -f "$2.new"; from_release; }
   fi
   mv -f "$2.new" "$2"
+}
+# When a file will not come through even after the retries: the release build, which carries every file inside
+# itself, comes from another GitHub host and is one download. It runs in place of this script.
+RELEASE_URL=${PM_RELEASE_URL:-https://github.com/IAmRealSaeed/portmon/releases/latest/download/install_portmon.sh}
+from_release() {
+  local f
+  echo "raw.githubusercontent.com keeps failing from here; taking the release build instead (one file, all inside):" >&2
+  f=$(mktemp /tmp/install_portmon.XXXXXX)
+  if ! download "$RELEASE_URL" "$f" install_portmon.sh; then
+    echo "that did not come through either. Download install_portmon.sh from" >&2
+    echo "https://github.com/IAmRealSaeed/portmon/releases/latest on another machine, copy it here and run: bash install_portmon.sh" >&2
+    exit 1
+  fi
+  export PM_PASSWORD PM_CF_TOKEN PM_DOMAIN PM_PORT PM_EMAIL PM_AUTOADD   # what was typed here is not asked twice
+  exec bash "$f"
 }
 [ -z "${PM_SRC:-}" ] && [ "$TTY" = 1 ] && [ -z "${PM_DL_HEADED:-}" ] && echo "downloading from GitHub:" >&2   # the menu printed it
 fetch portmon.py /opt/portmon/portmon.py.new

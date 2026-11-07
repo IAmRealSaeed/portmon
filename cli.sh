@@ -34,12 +34,16 @@ draw() {
   for ((i = 0; i < w; i++)); do if [ "$i" -lt "$f" ]; then bar+="#"; else bar+="."; fi; done
   printf '\r  %-24s [%s] %3d%%' "$1" "$bar" "$2" >&2
 }
+# a try that brings no byte for 15 s is dropped and tried again (see install.sh)
+NET=(--connect-timeout 15 --speed-limit 1 --speed-time 15 --max-time 180 --retry 4 --retry-delay 1)
+RELEASE_URL=${PM_RELEASE_URL:-https://github.com/IAmRealSaeed/portmon/releases/latest/download/install_portmon.sh}
 download() {  # download <url> <file> <label>
-  [ -t 2 ] || { curl -fsSL "$1" -o "$2"; return; }
+  [ -t 2 ] || { curl -fsSL "${NET[@]}" "$1" -o "$2"; return; }
   local tok rc
   draw "$3" 0
-  curl -fL --progress-bar "$1" -o "$2" 2>&1 | while IFS= read -r -d $'\r' tok || [ -n "$tok" ]; do
-    if [[ $tok =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then draw "$3" "${BASH_REMATCH[1]}"; fi
+  curl -fL --progress-bar "${NET[@]}" "$1" -o "$2" 2>&1 | while IFS= read -r -d $'\r' tok || [ -n "$tok" ]; do
+    if [[ $tok == *"Will retry"* ]]; then printf '\r  %-24s %-36s' "$3" "no answer, trying again ..." >&2
+    elif [[ $tok =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]*$ ]]; then draw "$3" "${BASH_REMATCH[1]}"; fi
   done
   rc=${PIPESTATUS[0]}
   if [ "$rc" = 0 ]; then draw "$3" 100; printf '  %s KB\n' "$(( ($(stat -c %s "$2") + 1023) / 1024 ))" >&2; else printf '\n' >&2; fi
@@ -51,6 +55,13 @@ do_update() {
   dir=$(mktemp -d) || exit 1
   echo "downloading from GitHub:"
   if ! download "$REPO_RAW/install.sh" "$dir/install.sh" install.sh; then
+    # raw.githubusercontent.com would not answer: the release build is another host and carries everything
+    echo "raw.githubusercontent.com keeps failing from here; taking the release build instead (one file, all inside):"
+    if download "$RELEASE_URL" "$dir/install_portmon.sh" install_portmon.sh; then
+      bash "$dir/install_portmon.sh"; rc=$?
+      rm -rf "$dir"
+      exit $rc
+    fi
     rm -rf "$dir"
     echo "${R}GitHub is not reachable from this server.${N} Take install_portmon.sh from"
     echo "https://github.com/IAmRealSaeed/portmon/releases/latest, copy it here and run: bash install_portmon.sh"
