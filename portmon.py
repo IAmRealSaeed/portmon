@@ -7,8 +7,8 @@ output the reply direction, forward both, so a relay's own upstream connection i
 the same port number. The rules only count; they never accept or drop anything. Bytes are network bytes (IP + TCP/UDP
 headers included), so they run a few percent above what a VPN panel shows for the same traffic.
 
-Every `interval` seconds the counters are read, turned into deltas and stored in SQLite (minutes for 3 days, hours for
-90 days, days forever; days cut at Tehran time), together with a server sample (CPU, RAM, load, network, disk,
+Every `interval` seconds the counters are read, turned into deltas and stored in SQLite (minutes for 3 days, hours and
+days for ever; hours and days cut at Tehran time), together with a server sample (CPU, RAM, load, network, disk,
 connections; kept 7 days). A port can belong to several groups; a group's total is the sum of its ports, and every
 "all ports" total counts each port once. The dashboard (stdlib HTTP server, optional TLS, password login) shows usage
 per group and port for any range, per-day/per-hour charts, live rates, server resources, and manages groups/ports.
@@ -40,7 +40,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "2.4.1"
+VERSION = "2.5"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -421,12 +421,11 @@ def sample(rebuild=False):
 
 
 def prune():
+    """Minutes go after 3 days and server samples after 7; hours and days are kept for ever (a few MB a year),
+    so a window of chosen hours works however far back it lies."""
     cut_min = int(time.time()) - 3 * 86400
-    cut_hour = local_now(time.time() - 90 * 86400).strftime("%Y-%m-%d %H")
     with db() as c:
         c.execute("DELETE FROM usage_min WHERE ts < ?", (cut_min,))
-        c.execute("DELETE FROM usage_hour WHERE hour < ?", (cut_hour,))
-        c.execute("DELETE FROM nic_hour WHERE hour < ?", (cut_hour,))
         c.execute("DELETE FROM sys_min WHERE ts < ?", (int(time.time()) - 7 * 86400,))
         c.execute("DELETE FROM seen_ports WHERE last_seen < ?", (int(time.time()) - 7 * 86400,))
 
@@ -571,17 +570,42 @@ def day_start(day):
     return (dt.datetime.fromisoformat(day).replace(tzinfo=dt.timezone.utc) - off).timestamp()
 
 
-def nic_report(day_from, day_to):
-    """The main interface's bytes over a range of days, and whether all of the range (up to now) was counted."""
-    with db() as c:
-        r = c.execute("SELECT COALESCE(SUM(rx), 0) AS rx, COALESCE(SUM(tx), 0) AS tx, COALESCE(SUM(secs), 0) AS secs "
-                      "FROM nic_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchone()
-        first = c.execute("SELECT MIN(day) AS d FROM nic_day").fetchone()["d"]
-    start, end = day_start(day_from), min(time.time(), day_start(day_to) + 86400)
-    want = max(0.0, end - start)
+def hour_key(day, h):
+    """The usage_hour key of hour h (0..24) of a local day; hour 24 is the next day's 00."""
+    d = dt.date.fromisoformat(day) + dt.timedelta(days=h // 24)
+    return f"{d.isoformat()} {h % 24:02d}"
+
+
+def key_start(key):
+    """Epoch of the first second of a local hour key."""
+    return day_start(key[:10]) + int(key[11:13]) * 3600
+
+
+def nic_cover(r, first, start, end):
+    """Totals plus whether the stretch start..end (up to now) was all counted."""
+    want = max(0.0, min(time.time(), end) - start)
     missing = want - r["secs"]
     return {"rx": r["rx"], "tx": r["tx"], "since": first,
             "partial": bool(want) and missing > max(3 * max(60, int(CFG.get("interval", 60))), 0.02 * want)}
+
+
+NIC_SUM = "SELECT COALESCE(SUM(rx), 0) AS rx, COALESCE(SUM(tx), 0) AS tx, COALESCE(SUM(secs), 0) AS secs FROM "
+
+
+def nic_report(day_from, day_to):
+    """The main interface's bytes over a range of days, and whether all of the range (up to now) was counted."""
+    with db() as c:
+        r = c.execute(NIC_SUM + "nic_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchone()
+        first = c.execute("SELECT MIN(day) AS d FROM nic_day").fetchone()["d"]
+    return nic_cover(r, first, day_start(day_from), day_start(day_to) + 86400)
+
+
+def nic_window(lo, hi):
+    """The same over hour keys lo (included) .. hi (left out)."""
+    with db() as c:
+        r = c.execute(NIC_SUM + "nic_hour WHERE hour >= ? AND hour < ?", (lo, hi)).fetchone()
+        first = c.execute("SELECT MIN(day) AS d FROM nic_day").fetchone()["d"]
+    return nic_cover(r, first, key_start(lo), key_start(hi))
 
 
 def layout():
@@ -604,18 +628,41 @@ def scope_ports(ports, group):
     return [p["port"] for p in ports if gid in p["groups"]]
 
 
-def report(day_from, day_to, group=None):
+def report(day_from, day_to, group=None, hour_from=0, hour_to=24):
+    """Usage over whole days (day_from..day_to, from usage_day, kept for ever), or over a window that starts at
+    hour_from of day_from and ends at hour_to of day_to (from usage_hour, also kept for ever). A window of up to 48
+    hours is charted hour by hour, a longer one day by day."""
     groups, ports = layout()
     in_scope = set(scope_ports(ports, group))
+    whole = hour_from == 0 and hour_to == 24
     with db() as c:
-        rows = c.execute("SELECT day, port, rx, tx FROM usage_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchall()
-        nic_days = {r["day"]: r["rx"] for r in c.execute("SELECT day, rx FROM nic_day WHERE day BETWEEN ? AND ?",
-                                                         (day_from, day_to))}
-    per_port, per_day = {}, {}
+        if whole:
+            rows = c.execute("SELECT day AS k, port, rx, tx FROM usage_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchall()
+            nic_rows = c.execute("SELECT day AS k, rx FROM nic_day WHERE day BETWEEN ? AND ?", (day_from, day_to)).fetchall()
+        else:
+            lo, hi = hour_key(day_from, hour_from), hour_key(day_to, hour_to)
+            if lo >= hi:
+                raise ValueError("the window ends before it starts")
+            rows = c.execute("SELECT hour AS k, port, rx, tx FROM usage_hour WHERE hour >= ? AND hour < ?", (lo, hi)).fetchall()
+            nic_rows = c.execute("SELECT hour AS k, rx FROM nic_hour WHERE hour >= ? AND hour < ?", (lo, hi)).fetchall()
+    if whole:
+        unit, nic = "day", nic_report(day_from, day_to)
+        d0, d1 = dt.date.fromisoformat(day_from), dt.date.fromisoformat(day_to)
+        keys = [(d0 + dt.timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
+    else:
+        t0, t1 = key_start(lo), key_start(hi)
+        hours = [local_now(t).strftime("%Y-%m-%d %H") for t in range(int(t0), int(t1), 3600)]
+        unit, nic = ("hour" if t1 - t0 <= 48 * 3600 else "day"), nic_window(lo, hi)
+        keys = hours if unit == "hour" else sorted({h[:10] for h in hours})
+    bucket = (lambda k: k[:10]) if unit == "day" else (lambda k: k)
+    per_port, per_key, nic_by = {}, {}, {}
     for r in rows:
         a = per_port.setdefault(r["port"], [0, 0])
         a[0] += r["rx"]; a[1] += r["tx"]
-        per_day.setdefault(r["day"], {})[r["port"]] = (r["rx"], r["tx"])
+        b = per_key.setdefault(bucket(r["k"]), {}).setdefault(r["port"], [0, 0])
+        b[0] += r["rx"]; b[1] += r["tx"]
+    for r in nic_rows:
+        nic_by[bucket(r["k"])] = nic_by.get(bucket(r["k"]), 0) + r["rx"]
     live = LIVE["ports"]
     port_rows = {p["port"]: dict(p, rx=per_port.get(p["port"], [0, 0])[0], tx=per_port.get(p["port"], [0, 0])[1],
                                  live=live.get(p["port"], {"rx_bps": 0, "tx_bps": 0})) for p in ports}
@@ -625,17 +672,13 @@ def report(day_from, day_to, group=None):
         out_groups.append(dict(g, ports=[x["port"] for x in gp], rx=sum(x["rx"] for x in gp), tx=sum(x["tx"] for x in gp),
                                live=sum(x["live"]["rx_bps"] + x["live"]["tx_bps"] for x in gp)))
     ungrouped = [p["port"] for p in ports if not p["groups"]]
-    days = []
-    d0, d1 = dt.date.fromisoformat(day_from), dt.date.fromisoformat(day_to)
-    for i in range((d1 - d0).days + 1):
-        d = (d0 + dt.timedelta(days=i)).isoformat()
-        pd = per_day.get(d, {})
-        days.append(dict(series_point(d, pd, in_scope, groups, ports), nic=nic_days.get(d)))
+    days = [dict(series_point(k, per_key.get(k, {}), in_scope, groups, ports), nic=nic_by.get(k)) for k in keys]
     tot_rx = sum(port_rows[p]["rx"] for p in in_scope)
     tot_tx = sum(port_rows[p]["tx"] for p in in_scope)
-    return {"from": day_from, "to": day_to, "scope": group or "all", "groups": out_groups, "ports": list(port_rows.values()),
-            "ungrouped": ungrouped, "days": days, "total": {"rx": tot_rx, "tx": tot_tx},
-            "nic": nic_report(day_from, day_to), "unwatched": unwatched(),
+    return {"from": day_from, "to": day_to, "hour_from": hour_from, "hour_to": hour_to, "unit": unit,
+            "now_hour": local_now().strftime("%Y-%m-%d %H"), "scope": group or "all", "groups": out_groups,
+            "ports": list(port_rows.values()), "ungrouped": ungrouped, "days": days, "total": {"rx": tot_rx, "tx": tot_tx},
+            "nic": nic, "unwatched": unwatched(),
             "live": {"rx_bps": sum(live.get(p, {}).get("rx_bps", 0) for p in in_scope),
                      "tx_bps": sum(live.get(p, {}).get("tx_bps", 0) for p in in_scope), "interval": LIVE["interval"],
                      "ts": LIVE["ts"]}}
@@ -815,9 +858,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 today = local_now().date().isoformat()
                 f, t = q.get("from", today), q.get("to", today)
                 dt.date.fromisoformat(f); dt.date.fromisoformat(t)
-                if f > t:
+                fh, th = int(q.get("fh", 0)), int(q.get("th", 24))   # the window's first hour, and the hour it ends at
+                if not (0 <= fh <= 23 and 1 <= th <= 24):
+                    raise ValueError("hour")
+                if f > t and fh == 0 and th == 24:
                     f, t = t, f
-                return self.send(200, report(f, t, q.get("group")))
+                return self.send(200, report(f, t, q.get("group"), fh, th))
             if u.path == "/api/hourly":
                 day = q.get("day", local_now().date().isoformat())
                 dt.date.fromisoformat(day)
@@ -977,6 +1023,8 @@ section{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;min-width:0}
   transition:background-color .15s var(--ease),color .15s var(--ease)}
 .seg button:hover{color:var(--t1)}.seg button.on{background:var(--sel);color:var(--onsel)}
 .custom{display:flex;flex-wrap:wrap;align-items:center;gap:8px;color:var(--t3);font-size:13px}.custom input{height:32px;padding:0 8px;min-width:0;flex:1 1 128px}.custom .btn{height:32px}
+.custom select{height:32px;padding:0 8px;flex:none;font-variant-numeric:tabular-nums;cursor:pointer}
+.custom .pair{display:flex;align-items:center;gap:8px;flex:1 1 240px;min-width:0}.custom .pair label{flex:none;min-width:16px}
 .scopes{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.scopes>span{font-size:13px;color:var(--t3);margin-inline-end:4px}
 .chip{height:32px;padding:0 12px;border-radius:8px;border:1px solid var(--line);background:none;color:var(--t2);cursor:pointer;
   display:inline-flex;align-items:center;gap:8px;transition:background-color .15s var(--ease),color .15s var(--ease),border-color .15s var(--ease)}
@@ -1057,7 +1105,7 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
 <section id="rep">
  <div class="tools">
   <div class="seg" id="ranges" aria-label="بازه"><button data-r="today">امروز</button><button data-r="yesterday">دیروز</button><button class="on" data-r="7">۷ روز</button><button data-r="30">۳۰ روز</button><button data-r="90">۹۰ روز</button></div>
-  <div class="custom"><label for="from">از</label><input type="date" id="from"><label for="to">تا</label><input type="date" id="to"><button class="btn" id="apply">نمایش</button></div>
+  <div class="custom"><span class="pair"><label for="from">از</label><input type="date" id="from"><select id="fh" aria-label="ساعت شروع"></select></span><span class="pair"><label for="to">تا</label><input type="date" id="to"><select id="th" aria-label="ساعت پایان"></select></span><button class="btn" id="apply">نمایش</button></div>
  </div>
  <div class="scopes" id="scopes"></div>
  <div class="alerts" id="unw" role="status"></div>
@@ -1151,11 +1199,20 @@ function renderScopes(){
   $('#scopes').innerHTML='<span>نمایش</span>'+one('all','همهٔ پورت‌ها')+CFG.groups.map(g=>one(String(g.id),esc(g.name),g.color)).join('');
   $$('#scopes [data-s]').forEach(b=>b.onclick=()=>{SCOPE=b.dataset.s;renderScopes();load()});
 }
+/* «۰۸:۰۰»: the hour pickers beside the dates; the end picker runs to ۲۴:۰۰, the end of its day */
+const hh=h=>Number(h).toLocaleString('fa-IR',{minimumIntegerDigits:2})+':'+'۰۰';
+$('#fh').innerHTML=[...Array(24).keys()].map(h=>`<option value="${h}">${hh(h)}</option>`).join('');
+$('#th').innerHTML=[...Array(24).keys()].map(h=>`<option value="${h+1}"${h==23?' selected':''}>${hh(h+1)}</option>`).join('');
+const jalDay=d=>DF({year:'numeric',month:'long',day:'numeric'}).format(D(d));
 async function load(){
-  const [f,t]=RANGE=='custom'?[$('#from').value,$('#to').value]:rangeDates(RANGE);
-  $('#from').value=f;$('#to').value=t;
+  const custom=RANGE=='custom';
+  const [f,t]=custom?[$('#from').value,$('#to').value]:rangeDates(RANGE);
+  const [fh,th]=custom?[Number($('#fh').value),Number($('#th').value)]:[0,24];
+  $('#from').value=f;$('#to').value=t;$('#fh').value=fh;$('#th').value=th;
+  const whole=fh==0&&th==24;
+  if(!whole&&(f>t||(f==t&&fh>=th)))return toast('شروع بازه باید پیش از پایانش باشد');
   const sq=SCOPE=='all'?'':`&group=${SCOPE}`;
-  const R=await api(`/api/report?from=${f}&to=${t}${sq}`);
+  const R=await api(`/api/report?from=${f}&to=${t}${sq}${whole?'':`&fh=${fh}&th=${th}`}`);
   $('#c_rx').innerHTML=QB(R.total.rx);$('#c_tx').innerHTML=QB(R.total.tx);$('#c_tot').innerHTML=QB(R.total.rx+R.total.tx);
   const g=SCOPE=='all'?null:G(SCOPE);
   $('#c_tot_s').textContent=g?`گروه «${g.name}»`:'هر پورت یک بار حساب شده';
@@ -1167,10 +1224,14 @@ async function load(){
   $('#c_nic_s').innerHTML=!N.since?'از چند دقیقهٔ دیگر':(SCOPE=='all'?'':'کل سرور · ')+`خروجی ${nb(N.tx)}`
     +(N.partial?(N.since>f?` · ثبت از ${jal(N.since)}`:' · بخشی از بازه ثبت نشده'):'');
   renderUnwatched(R.unwatched);
-  $('#range_lbl').textContent=jalRange(f,t);
+  $('#range_lbl').textContent=whole?jalRange(f,t):f==t?`${jalFull(f)}، ساعت ${hh(fh)} تا ${hh(th)}`
+    :`${jalDay(f)} ساعت ${hh(fh)} تا ${jalDay(t)} ساعت ${hh(th)}`;
   renderTable(R);
-  if(f==t){const H=await api(`/api/hourly?day=${f}${sq}`);$('#chart_title').textContent='مصرف ساعتی';
+  if(whole&&f==t){const H=await api(`/api/hourly?day=${f}${sq}`);$('#chart_title').textContent='مصرف ساعتی';
     drawUsage(H.hours.map(x=>({lbl:fa(Number(x.key)),full:`ساعت ${fa(Number(x.key))} تا ${fa(Number(x.key)+1)}`,...x})))}
+  else if(R.unit=='hour'){$('#chart_title').textContent='مصرف ساعتی';   /* a window of up to 48 hours */
+    drawUsage(R.days.map((x,i)=>{const d=x.key.slice(0,10),h=Number(x.key.slice(11)),now=x.key==R.now_hour;
+      return {lbl:f!=t&&(h==0||i==0)?jal(d):fa(h),full:`${jalFull(d)}، ساعت ${hh(h)} تا ${hh(h+1)}`+(now?'، تا این لحظه':''),now,...x}}))}
   else{$('#chart_title').textContent='مصرف روزانه';
     drawUsage(R.days.map(x=>({lbl:x.key==CFG.today?'امروز':jal(x.key),full:jalFull(x.key)+(x.key==CFG.today?'، تا این لحظه':''),now:x.key==CFG.today,...x})))}
 }
