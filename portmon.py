@@ -38,9 +38,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
-VERSION = "2.6"
+VERSION = "2.7"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -832,6 +834,137 @@ def change_port(b):
     return {"ok": True}
 
 
+# ------------------------------------------------------------------ updates from the dashboard
+# The newest release is looked up on GitHub twice a day (and when asked). Updating runs the same `portmon update` the
+# terminal menu does, as a transient systemd unit: outside this service, so the restart at its end does not kill it,
+# and outside this service's sandbox (ProtectSystem), which would keep it from writing /etc and /usr/local/bin.
+REPO = "IAmRealSaeed/portmon"
+UPDATE_UNIT = "portmon-update"
+UPDATE_EVERY = 12 * 3600
+UPDATE = {"latest": "", "notes": "", "url": "", "checked": 0, "error": ""}
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def vtuple(v):
+    """«v2.4.1» → (2, 4, 1); None for anything that is not a version number."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)", str(v or "").strip())
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def is_newer(latest, current=None):
+    a, b = vtuple(latest), vtuple(current or VERSION)
+    return bool(a and b and a > b)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def latest_release(timeout=15):
+    """(tag, notes, url) of the newest release. GitHub's API first, for the notes; when it does not answer (some
+    networks reach github.com but not api.github.com), the tag github.com's own «latest» link redirects to."""
+    head = {"User-Agent": f"portmon/{VERSION}"}
+    api = os.environ.get("PM_RELEASE_API") or f"https://api.github.com/repos/{REPO}/releases/latest"   # env: tests
+    try:
+        req = urllib.request.Request(api, headers=dict(head, Accept="application/vnd.github+json"))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read(1_000_000))
+        if isinstance(d, dict) and vtuple(d.get("tag_name")):
+            return d["tag_name"], str(d.get("body") or "")[:4000], str(d.get("html_url") or "")
+    except (OSError, ValueError):
+        pass
+    try:
+        urllib.request.build_opener(_NoRedirect).open(
+            urllib.request.Request(f"https://github.com/{REPO}/releases/latest", headers=head), timeout=timeout)
+    except urllib.error.HTTPError as e:
+        where = e.headers.get("Location") or ""
+        m = re.search(r"/releases/tag/([^/?#]+)$", where)
+        if e.code in (301, 302, 303, 307, 308) and m and vtuple(m.group(1)):
+            return m.group(1), "", where
+        raise OSError(f"github.com answered {e.code}")
+    raise OSError("github.com did not point at a release")
+
+
+def check_update():
+    try:
+        tag, notes, url = latest_release()
+        UPDATE.update(latest=tag.lstrip("v"), notes=notes, url=url, error="")
+    except (OSError, ValueError) as e:
+        UPDATE["error"] = str(e)[:200] or type(e).__name__
+    UPDATE["checked"] = int(time.time())
+
+
+def update_checker():
+    time.sleep(20)
+    while True:
+        check_update()
+        time.sleep(UPDATE_EVERY)
+
+
+def update_files():
+    d = os.path.dirname(CFG["db"])
+    return os.path.join(d, "update.log"), os.path.join(d, "update.json")
+
+
+def update_running():
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", UPDATE_UNIT], timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def update_state():
+    log, meta = update_files()
+    try:
+        with open(meta, encoding="utf-8") as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            tail = f.read()[-6000:].splitlines()[-40:]
+    except OSError:
+        tail = []
+    rc = last.get("rc")
+    return {"current": VERSION, "latest": UPDATE["latest"], "newer": is_newer(UPDATE["latest"]), "notes": UPDATE["notes"],
+            "url": UPDATE["url"], "checked": UPDATE["checked"], "error": UPDATE["error"], "running": update_running(),
+            "last": {"started": last.get("started"), "from": last.get("from"), "to": last.get("to"), "rc": rc},
+            "log": tail}
+
+
+def start_update(want):
+    """Start `portmon update` beside this service. `want` is the version the person confirmed: the update goes ahead
+    only while that is still the newest one, so a stale page cannot install something it did not show."""
+    if update_running():
+        raise ValueError("به‌روزرسانی از قبل در جریان است.")
+    if not is_newer(UPDATE["latest"]) or str(want or "") != UPDATE["latest"]:
+        raise ValueError("نسخهٔ تازه‌ای برای نصب نیست؛ صفحه را دوباره باز کنید.")
+    cli = os.path.join(APP_DIR, "cli.sh")
+    if not os.path.isfile(cli):
+        raise ValueError("cli.sh کنار برنامه نیست؛ این بار با دستور `sudo portmon update` روی سرور به‌روز کنید.")
+    log, meta = update_files()
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(f"{local_now().strftime('%Y-%m-%d %H:%M')} portmon {VERSION} -> {UPDATE['latest']}\n")
+    with open(meta, "w", encoding="utf-8") as f:
+        json.dump({"started": int(time.time()), "from": VERSION, "to": UPDATE["latest"], "rc": None}, f)
+    # Paths go in as arguments, never into the command text. The exit code is written back when it is over, by
+    # which time this process has been replaced by the new one; that one reads it.
+    script = ('bash "$1" update >>"$2" 2>&1; rc=$?; '
+              'python3 -c "import json,sys; p=sys.argv[1]; d=json.load(open(p)); d[\'rc\']=int(sys.argv[2]); '
+              'json.dump(d, open(p, \'w\'))" "$3" "$rc"')
+    env = [f"--setenv={k}={os.environ[k]}" for k in ("PM_REPO_RAW", "PM_RELEASE_URL", "PM_RELEASE_API") if os.environ.get(k)]
+    try:
+        r = subprocess.run(["systemd-run", f"--unit={UPDATE_UNIT}", "--collect", "--quiet", *env,
+                            "/bin/bash", "-c", script, "portmon-update", cli, log, meta],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ValueError(f"به‌روزرسانی راه نیفتاد: {e}")
+    if r.returncode:
+        raise ValueError("به‌روزرسانی راه نیفتاد: " + (r.stderr or r.stdout).strip()[:300])
+    return {"ok": True}
+
+
 # ------------------------------------------------------------------ web
 def sign(value):
     return hmac.new(CFG["secret"].encode(), value.encode(), hashlib.sha256).hexdigest()
@@ -922,6 +1055,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, hourly(day, q.get("group")))
             if u.path == "/api/system":
                 return self.send(200, system_report(max(1, min(168, int(q.get("hours", 24))))))
+            if u.path == "/api/update":
+                return self.send(200, update_state())
             if u.path == "/api/config":
                 groups, ports = layout()
                 return self.send(200, {"groups": groups, "ports": ports, "listening": listening_ports(), "palette": PALETTE,
@@ -959,6 +1094,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, change_group(b))
             if u.path == "/api/port":
                 return self.send(200, change_port(b))
+            if u.path == "/api/update":
+                if b.get("action") == "check":
+                    check_update()
+                    return self.send(200, update_state())
+                if b.get("action") == "run":
+                    return self.send(200, start_update(b.get("to")))
+                raise ValueError("action?")
             if u.path == "/api/password":
                 if not check_password(str(b.get("old", "")), CFG.get("password_hash", "")):
                     return self.send(400, {"error": "رمز فعلی درست نیست."})
@@ -1006,6 +1148,7 @@ def main():
     init_db()
     LIVE["interval"] = float(CFG["interval"])
     threading.Thread(target=collector, daemon=True).start()
+    threading.Thread(target=update_checker, daemon=True).start()
     srv = Server((CFG["listen"], int(CFG["port"])), Handler)
     if CFG.get("tls_cert") and CFG.get("tls_key"):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1127,6 +1270,28 @@ tr.tot td{font-weight:500;background:var(--raised);border-bottom:0}
 .tip b{display:block;margin-bottom:4px}.tip .r{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .tip .r span:first-child{display:inline-flex;align-items:center;gap:8px;color:var(--t2)}.tip .hd{margin-top:8px;color:var(--t3);font-size:12px}
 .hide{display:none!important}
+.upd{align-self:center;display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;font:inherit;font-size:12px;
+  white-space:nowrap;cursor:pointer;color:var(--t1);border:1px solid color-mix(in srgb,var(--live) 45%,var(--line));
+  background:color-mix(in srgb,var(--live) 12%,var(--card))}.upd:hover{border-color:var(--live)}
+.upd::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--live)}
+.updrow .txt{flex:1;min-width:200px;display:grid;gap:2px}.updrow .txt b{font-size:14px;font-weight:500}.updrow .txt span{font-size:12px;color:var(--t2)}
+.updrow .acts{display:flex;gap:8px}#upd_last a{color:var(--t1);text-underline-offset:3px}
+@media (max-width:640px){.brand:has(.upd:not(.hide)) span{display:none}}
+.dlg{width:min(560px,calc(100% - 32px));max-height:calc(100% - 48px);padding:0;border:1px solid var(--line2);border-radius:14px;
+  background:var(--card);color:var(--t1);box-shadow:var(--shadow)}.dlg::backdrop{background:rgba(0,0,0,.55)}
+.dlg .dh{margin:0;padding:18px 20px 4px;font-size:16px;font-weight:500}
+.dlg .db{padding:8px 20px 16px;display:grid;gap:12px;font-size:14px;line-height:1.8;color:var(--t2)}.dlg .db p{margin:0}
+.dlg .notes,.dlg .log{margin:0;max-height:34vh;overflow:auto;padding:10px 12px;border:1px solid var(--line);border-radius:10px;
+  background:var(--bg);color:var(--t1);font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.dlg .notes{unicode-bidi:plaintext;text-align:start}.dlg .notes b{font-weight:500}
+.dlg .notes code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;direction:ltr;unicode-bidi:isolate;
+  background:var(--raised);padding:1px 5px;border-radius:4px}
+.dlg .notes code.blk{display:block;margin:2px 0;padding:6px 10px;text-align:left;white-space:pre-wrap}
+.dlg .log{direction:ltr;text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.dlg .st{display:flex;align-items:center;gap:10px;color:var(--t1)}.dlg .st.bad{color:var(--bad)}
+.spin{width:14px;height:14px;flex:none;border-radius:50%;border:2px solid var(--line2);border-top-color:var(--t1);animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.dlg .df{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;padding:12px 20px 16px;border-top:1px solid var(--line)}
 .sgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:16px}.sgrid .w4{grid-column:span 4}.sgrid .w2{grid-column:span 2}.sgrid .w3{grid-column:span 3}
 td .pid{font-size:12px;color:var(--t3);margin-inline-start:8px;unicode-bidi:isolate}.nw{white-space:nowrap}
 .mgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px;align-items:start}
@@ -1151,7 +1316,7 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
   .prow .btn{grid-column:2;justify-self:start}.form{padding:0 16px 16px}.row{padding:12px 16px}.cap{padding:0 16px 12px}.toast{left:16px;right:16px;bottom:16px}}
 @media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
 </style></head><body>
-<header class="top"><div class="brand"><b>{{TITLE}}</b><span id="host"></span></div>
+<header class="top"><div class="brand"><b>{{TITLE}}</b><span id="host"></span><button class="upd hide" id="upd_badge" type="button"></button></div>
 <nav class="tabs" aria-label="بخش‌ها"><button class="on" data-tab="rep">مصرف پورت‌ها</button><button data-tab="sys">منابع سرور</button><button data-tab="mgr">تنظیمات</button></nav>
 <a class="out" href="/logout">خروج</a></header>
 <main>
@@ -1202,8 +1367,12 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
   <div class="form"><div class="field"><label for="pw_old">رمز فعلی</label><input id="pw_old" type="password" autocomplete="current-password"></div>
    <div class="field"><label for="pw_new">رمز جدید</label><input id="pw_new" type="password" autocomplete="new-password" aria-describedby="pw_h"></div>
    <button class="btn pri" id="pw_btn">ذخیره</button></div><p class="cap" id="pw_h">رمز جدید دست‌کم ۸ نویسه</p></div>
+ <div class="panel"><div class="ph"><h2>به‌روزرسانی</h2><span class="sub" id="upd_sub"></span></div>
+  <div class="row updrow"><div class="txt" id="upd_txt"></div><div class="acts"><button class="btn sm" id="upd_check" type="button">بررسی دوباره</button><button class="btn sm pri hide" id="upd_go" type="button"></button></div></div>
+  <p class="cap" id="upd_last"></p></div>
 </section>
 </main><div class="tip" id="tip"></div><div class="toast" id="toast" role="status"></div>
+<dialog class="dlg" id="upd_dlg" aria-labelledby="upd_dh"></dialog>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const fa=(n,d)=>Number(n).toLocaleString('fa-IR',d==null?undefined:{maximumFractionDigits:d});
@@ -1431,7 +1600,72 @@ $$('[data-h]').forEach(b=>b.onclick=()=>{HOURS=Number(b.dataset.h);$$('[data-h]'
 $('#apply').onclick=()=>{RANGE='custom';$$('#ranges [data-r]').forEach(x=>x.classList.remove('on'));load()};
 let RT;addEventListener('resize',()=>{clearTimeout(RT);RT=setTimeout(()=>{if(TAB=='rep'&&LAST.usage)drawUsage(LAST.usage);
   if(TAB=='sys')['#ch_net','#ch_cpu','#ch_mem'].forEach(el=>LAST[el]&&lineChart(el,...LAST[el]))},150)});
-(async()=>{await loadCfg();await load();setInterval(()=>{if(document.hidden)return;TAB=='sys'?loadSys():TAB=='rep'?load():0},60000)})();
+/* ---------------- updates: a newer release, installed from here after a final yes ---------------- */
+let UPD=null;
+function since(ts){const m=Math.max(1,Math.round((Date.now()/1000-ts)/60));
+  return m<60?`${fa(m)} دقیقه پیش`:m<1440?`${fa(Math.round(m/60))} ساعت پیش`:`${fa(Math.round(m/1440))} روز پیش`}
+let WATCHING=false;
+async function loadUpd(follow){try{UPD=await api('/api/update')}catch(e){return}renderUpd();
+  if(follow&&UPD.running&&!WATCHING)watchUpd(UPD.last.from||UPD.current,UPD.last.to||UPD.latest)}   /* opened mid-update */
+function renderUpd(){const u=UPD;if(!u)return;
+  const b=$('#upd_badge');b.classList.toggle('hide',!u.newer||u.running);b.textContent=`نسخهٔ ${u.latest} آمده`;
+  b.title='به‌روزرسانی از همین صفحه';
+  $('#upd_txt').innerHTML=u.newer?`<b>نسخهٔ ${esc(u.latest)} آمده</b><span>الان نسخهٔ ${esc(u.current)} نصب است</span>`
+    :u.latest?`<b>به‌روز است</b><span>نسخهٔ ${esc(u.current)}، تازه‌ترین نسخه</span>`
+    :`<b>نسخهٔ ${esc(u.current)}</b><span>${u.checked?'گیت‌هاب جواب نداد؛ بعداً دوباره بررسی کنید':'هنوز بررسی نشده'}</span>`;
+  $('#upd_sub').textContent=u.checked?`آخرین بررسی ${since(u.checked)}`+(u.error&&u.latest?'، ناموفق':''):'';
+  const go=$('#upd_go');go.classList.toggle('hide',!u.newer||u.running);go.textContent=`به‌روزرسانی به ${u.latest}`;
+  const L=u.last||{};let t='';
+  if(u.running)t='یک به‌روزرسانی در جریان است.';
+  else if(L.started&&L.rc===0)t=`آخرین به‌روزرسانی: از ${esc(L.from)} به ${esc(L.to)}، ${since(L.started)}.`;
+  else if(L.started&&L.rc!=null)t=`آخرین به‌روزرسانی (${since(L.started)}) انجام نشد. <a href="#" id="upd_showlog">گزارش</a>`;
+  else if(L.started)t=`آخرین به‌روزرسانی (${since(L.started)}) ناتمام ماند. <a href="#" id="upd_showlog">گزارش</a>`;
+  $('#upd_last').innerHTML=t;$('#upd_last').classList.toggle('hide',!t);
+  const sl=$('#upd_showlog');if(sl)sl.onclick=e=>{e.preventDefault();showDlg(`<h3 class="dh" id="upd_dh">گزارش آخرین به‌روزرسانی</h3><div class="db">
+    <pre class="log">${esc((u.log||[]).join('\n'))||'خالی'}</pre></div><div class="df"><button class="btn" data-x type="button">بستن</button></div>`)}}
+/* release notes are GitHub Markdown: escaped first, then only bold, inline and block code and list dashes are kept */
+function mdLite(s){return String(s||'').split(/```[a-z]*\n?/).map((p,i)=>i%2?`<code class="blk">${esc(p.replace(/\n$/,''))}</code>`
+  :esc(p).replace(/^#+\s*(.+)$/gm,'<b>$1</b>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>').replace(/`([^`\n]+)`/g,'<code>$1</code>')
+    .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g,'$1').replace(/^- /gm,'• ')).join('').replace(/\n{3,}/g,'\n\n').trim()}
+function showDlg(html){const d=$('#upd_dlg');d.innerHTML=html;if(!d.open)d.showModal();
+  $$('#upd_dlg [data-x]').forEach(b=>b.onclick=()=>d.close());const lg=d.querySelector('.log');if(lg)lg.scrollTop=lg.scrollHeight;return d}
+function confirmUpd(){const u=UPD;if(!u||!u.newer)return;
+  showDlg(`<h3 class="dh" id="upd_dh">به‌روزرسانی به نسخهٔ ${esc(u.latest)}</h3><div class="db">
+    <p>الان نسخهٔ ${esc(u.current)} نصب است.${u.notes?' تغییرات نسخهٔ تازه:':''}</p>
+    ${u.notes?`<div class="notes">${mdLite(u.notes)}</div>`:u.url?`<p><a href="${esc(u.url)}" target="_blank" rel="noopener">تغییرات این نسخه در گیت‌هاب</a></p>`:''}
+    <p>برنامه از گیت‌هاب گرفته می‌شود و سرویس یک بار ری‌استارت می‌شود، پس داشبورد چند ثانیه در دسترس نیست. شمارش ترافیک ادامه دارد و آمار، گروه‌ها، رمز و تنظیمات همه می‌مانند.</p></div>
+    <div class="df"><button class="btn" data-x type="button">انصراف</button><button class="btn pri" id="upd_yes" type="button">بله، به‌روزرسانی کن</button></div>`);
+  $('#upd_yes').onclick=async()=>{const b=$('#upd_yes');b.disabled=true;b.textContent='در حال شروع…';
+    try{await api('/api/update',{action:'run',to:u.latest});watchUpd(u.current,u.latest)}
+    catch(e){b.disabled=false;b.textContent='بله، به‌روزرسانی کن';if(e)toast(e.message||'به‌روزرسانی راه نیفتاد');loadUpd()}}}
+/* follows the update to its end: the page talks to the old service, loses it during the restart, and finds the new one */
+function watchUpd(from,to){const t0=Date.now();let log=[],hidden=false;WATCHING=true;
+  /* «پنهان کن» only hides the window: the update goes on, and its end still reloads the page or says it failed */
+  const paint=(st,cls,end)=>{if(hidden&&!end)return;if(hidden){toast(st.replace(/<[^>]+>/g,''));return}
+    showDlg(`<h3 class="dh" id="upd_dh">به‌روزرسانی به نسخهٔ ${esc(to)}</h3><div class="db">
+    <p class="st ${cls||''}" role="status">${end?'':'<i class="spin" aria-hidden="true"></i>'}<span>${st}</span></p>${log.length?`<pre class="log">${esc(log.join('\n'))}</pre>`:''}</div>
+    <div class="df"><button class="btn" data-x type="button">${end?'بستن':'پنهان کن؛ کار ادامه دارد'}</button></div>`);
+    $('#upd_dlg').onclose=()=>{hidden=true}};
+  const finish=()=>{WATCHING=false;$('#upd_dlg').onclose=null};
+  const tick=async()=>{let u=null;
+    try{const r=await fetch('/api/update',{cache:'no-store'});if(r.status==401){location='/login';return}if(r.ok)u=await r.json()}catch(e){}
+    if(u&&u.log&&u.log.length)log=u.log;
+    if(!u)paint('سرویس در حال راه‌اندازی دوباره است…');
+    else if(u.current!==from&&!u.running){finish();paint(`به نسخهٔ ${esc(u.current)} به‌روز شد. صفحه دوباره باز می‌شود…`,'',true);
+      setTimeout(()=>location.reload(),1500);return}
+    else if(!u.running&&u.last&&u.last.rc!=null){finish();UPD=u;renderUpd();   /* the attempt that just ended: each start resets rc */
+      paint(u.last.rc===0?'کار تمام شد ولی نسخه عوض نشد؛ گزارش را ببینید.'
+        :`به‌روزرسانی انجام نشد (کد ${fa(u.last.rc)}). نسخهٔ ${esc(u.current)} سر جایش است و کار می‌کند.`,'bad',true);return}
+    else paint(u.current!==from?`نسخهٔ ${esc(u.current)} بالا آمد؛ کارهای آخر…`:'در حال دریافت و نصب…');
+    if(Date.now()-t0>6*60000){finish();paint('بیش از ۶ دقیقه طول کشید. گزارش را ببینید، یا روی سرور دستور portmon log را بزنید.','bad',true);return}
+    setTimeout(tick,2000)};
+  paint('در حال دریافت و نصب…');setTimeout(tick,1500)}
+$('#upd_badge').onclick=confirmUpd;$('#upd_go').onclick=confirmUpd;
+$('#upd_check').onclick=async()=>{const b=$('#upd_check');b.disabled=true;b.textContent='در حال بررسی…';
+  try{UPD=await api('/api/update',{action:'check'});renderUpd();toast(UPD.newer?`نسخهٔ ${UPD.latest} آمده`:UPD.latest?'به‌روز است':'گیت‌هاب جواب نداد')}
+  catch(e){if(e)toast(e.message)}b.disabled=false;b.textContent='بررسی دوباره'};
+(async()=>{await loadCfg();await load();loadUpd(true);setInterval(()=>{if(document.hidden)return;TAB=='sys'?loadSys():TAB=='rep'?load():0},60000);
+  setInterval(()=>{if(!document.hidden&&!WATCHING)loadUpd()},30*60000)})();
 </script></body></html>"""
 
 if __name__ == "__main__":
