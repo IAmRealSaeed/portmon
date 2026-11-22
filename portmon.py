@@ -40,7 +40,7 @@ import threading
 import time
 import urllib.parse
 
-VERSION = "2.5"
+VERSION = "2.6"
 DEFAULTS = {"listen": "0.0.0.0", "port": 8800, "interval": 60, "utc_offset_minutes": 210, "db": "/var/lib/portmon/portmon.db",
             "tls_cert": "", "tls_key": "", "password_hash": "", "secret": "", "title": "مصرف پورت‌ها",
             "fonts": "/opt/portmon/fonts"}
@@ -82,6 +82,25 @@ def save_config(path, cfg):
 def local_now(ts=None):
     off = dt.timedelta(minutes=int(CFG.get("utc_offset_minutes", 210)))
     return dt.datetime.fromtimestamp(ts if ts is not None else time.time(), dt.timezone.utc) + off
+
+
+def jalali(d):
+    """(year, month, day) of a date in the Persian calendar, the one the pages show (Intl's «persian»; the two agree
+    on every day from 2015 to 2045). The 33-year arithmetic of jdf."""
+    gy, gm, gd = d.year, d.month, d.day
+    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    gy2 = gy + 1 if gm > 2 else gy
+    days = 355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 + gd + g_d_m[gm - 1]
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        return jy, 1 + days // 31, 1 + days % 31
+    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
 
 
 def hash_password(pw, salt=None, rounds=240000):
@@ -628,10 +647,37 @@ def scope_ports(ports, group):
     return [p["port"] for p in ports if gid in p["groups"]]
 
 
+MONTHLY_AFTER_DAYS = 92   # a range of whole days longer than this (all time, a long custom one) is charted by month
+
+
+def first_day():
+    """The first day anything was counted on — a watched port's usage or the interface's — where «همه» (all time)
+    starts. Today on a fresh install."""
+    with db() as c:
+        r = c.execute("SELECT MIN(d) AS d FROM (SELECT MIN(day) AS d FROM usage_day WHERE port IN (SELECT port FROM ports) "
+                      "UNION ALL SELECT MIN(day) FROM nic_day)").fetchone()
+    return r["d"] or local_now().date().isoformat()
+
+
+def month_spans(keys):
+    """Persian month of each day in `keys` (consecutive ISO days), and per month the days of it in the range:
+    {month: {"from", "to", "part"}}, part when the range holds only some of that month's days."""
+    month_of, spans = {}, {}
+    for k in keys:
+        m = "%04d-%02d" % jalali(dt.date.fromisoformat(k))[:2]
+        month_of[k] = m
+        spans.setdefault(m, {"from": k})["to"] = k
+    for s in spans.values():
+        starts = jalali(dt.date.fromisoformat(s["from"]))[2] == 1
+        ends = jalali(dt.date.fromisoformat(s["to"]) + dt.timedelta(days=1))[2] == 1
+        s["part"] = not (starts and ends)
+    return month_of, spans
+
+
 def report(day_from, day_to, group=None, hour_from=0, hour_to=24):
     """Usage over whole days (day_from..day_to, from usage_day, kept for ever), or over a window that starts at
     hour_from of day_from and ends at hour_to of day_to (from usage_hour, also kept for ever). A window of up to 48
-    hours is charted hour by hour, a longer one day by day."""
+    hours is charted hour by hour, a longer one day by day; whole days beyond MONTHLY_AFTER_DAYS by Persian month."""
     groups, ports = layout()
     in_scope = set(scope_ports(ports, group))
     whole = hour_from == 0 and hour_to == 24
@@ -649,12 +695,17 @@ def report(day_from, day_to, group=None, hour_from=0, hour_to=24):
         unit, nic = "day", nic_report(day_from, day_to)
         d0, d1 = dt.date.fromisoformat(day_from), dt.date.fromisoformat(day_to)
         keys = [(d0 + dt.timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
+        spans = None
+        if len(keys) > MONTHLY_AFTER_DAYS:
+            unit = "month"
+            month_of, spans = month_spans(keys)
+            keys = list(spans)   # in date order: the dict was filled day by day
     else:
         t0, t1 = key_start(lo), key_start(hi)
         hours = [local_now(t).strftime("%Y-%m-%d %H") for t in range(int(t0), int(t1), 3600)]
         unit, nic = ("hour" if t1 - t0 <= 48 * 3600 else "day"), nic_window(lo, hi)
         keys = hours if unit == "hour" else sorted({h[:10] for h in hours})
-    bucket = (lambda k: k[:10]) if unit == "day" else (lambda k: k)
+    bucket = (lambda k: k[:10]) if unit == "day" else (lambda k: month_of[k]) if unit == "month" else (lambda k: k)
     per_port, per_key, nic_by = {}, {}, {}
     for r in rows:
         a = per_port.setdefault(r["port"], [0, 0])
@@ -672,7 +723,8 @@ def report(day_from, day_to, group=None, hour_from=0, hour_to=24):
         out_groups.append(dict(g, ports=[x["port"] for x in gp], rx=sum(x["rx"] for x in gp), tx=sum(x["tx"] for x in gp),
                                live=sum(x["live"]["rx_bps"] + x["live"]["tx_bps"] for x in gp)))
     ungrouped = [p["port"] for p in ports if not p["groups"]]
-    days = [dict(series_point(k, per_key.get(k, {}), in_scope, groups, ports), nic=nic_by.get(k)) for k in keys]
+    days = [dict(series_point(k, per_key.get(k, {}), in_scope, groups, ports), nic=nic_by.get(k),
+                 **(spans[k] if unit == "month" else {})) for k in keys]
     tot_rx = sum(port_rows[p]["rx"] for p in in_scope)
     tot_tx = sum(port_rows[p]["tx"] for p in in_scope)
     return {"from": day_from, "to": day_to, "hour_from": hour_from, "hour_to": hour_to, "unit": unit,
@@ -873,7 +925,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if u.path == "/api/config":
                 groups, ports = layout()
                 return self.send(200, {"groups": groups, "ports": ports, "listening": listening_ports(), "palette": PALETTE,
-                                       "today": local_now().date().isoformat(), "host": socket.gethostname(),
+                                       "today": local_now().date().isoformat(), "first_day": first_day(),
+                                       "host": socket.gethostname(),
                                        "version": VERSION, "dashboard_port": int(CFG["port"])})
         except ValueError:
             return self.send(400, {"error": "bad request"})
@@ -1104,7 +1157,7 @@ input[type=color]{width:36px;padding:2px;cursor:pointer}
 <main>
 <section id="rep">
  <div class="tools">
-  <div class="seg" id="ranges" aria-label="بازه"><button data-r="today">امروز</button><button data-r="yesterday">دیروز</button><button class="on" data-r="7">۷ روز</button><button data-r="30">۳۰ روز</button><button data-r="90">۹۰ روز</button></div>
+  <div class="seg" id="ranges" aria-label="بازه"><button data-r="today">امروز</button><button data-r="yesterday">دیروز</button><button class="on" data-r="7">۷ روز</button><button data-r="30">۳۰ روز</button><button data-r="90">۹۰ روز</button><button data-r="all" title="از اولین روزی که چیزی شمرده شد">همه</button></div>
   <div class="custom"><span class="pair"><label for="from">از</label><input type="date" id="from"><select id="fh" aria-label="ساعت شروع"></select></span><span class="pair"><label for="to">تا</label><input type="date" id="to"><select id="th" aria-label="ساعت پایان"></select></span><button class="btn" id="apply">نمایش</button></div>
  </div>
  <div class="scopes" id="scopes"></div>
@@ -1171,6 +1224,7 @@ const Q=([n,u])=>`<span class="q"><span>${n}</span>${u?`<small>${u}</small>`:''}
 const QB=b=>Number(b)?Q(unit(b)):Q(['۰','']), QR=bps=>Q(rateU(bps));
 const DF=o=>new Intl.DateTimeFormat('fa-IR-u-ca-persian',o), D=d=>new Date(d+'T12:00:00');
 const jal=d=>DF({month:'short',day:'numeric'}).format(D(d));
+const jMonth=d=>Number(new Intl.DateTimeFormat('en-u-ca-persian-nu-latn',{month:'numeric'}).format(D(d)));
 const jalFull=d=>DF({weekday:'long',year:'numeric',month:'long',day:'numeric'}).format(D(d));
 function jalRange(a,b){if(a==b)return jalFull(a);const f=DF({year:'numeric',month:'long',day:'numeric'});
   try{return f.formatRange(D(a),D(b))}catch(e){return f.format(D(a))+' تا '+f.format(D(b))}}
@@ -1180,7 +1234,9 @@ let CFG=null,OPEN=new Set(),RANGE='7',SCOPE='all',HOURS=24;const LAST={};
 async function api(p,body){const r=await fetch(p,body?{method:'POST',headers:{'Content-Type':'application/json','X-PM':'1'},body:JSON.stringify(body)}:{});if(r.status==401){location='/login';throw 0}const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j}
 function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove('show'),2600)}
 function addDays(iso,n){const d=new Date(iso+'T12:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)}
-function rangeDates(r){const t=CFG.today;if(r=='today')return[t,t];if(r=='yesterday'){const y=addDays(t,-1);return[y,y]}return[addDays(t,-(Number(r)-1)),t]}
+function rangeDates(r){const t=CFG.today;if(r=='today')return[t,t];if(r=='yesterday'){const y=addDays(t,-1);return[y,y]}
+  if(r=='all')return[CFG.first_day&&CFG.first_day<t?CFG.first_day:t,t];   /* all time: from the first day anything was counted */
+  return[addDays(t,-(Number(r)-1)),t]}
 const G=id=>CFG.groups.find(g=>String(g.id)===String(id));
 const gColor=id=>(G(id)||{}).color||'#85858b';
 const pLabel=p=>{const x=CFG.ports.find(q=>q.port==p);return x&&x.label?x.label:''};
@@ -1232,6 +1288,10 @@ async function load(){
   else if(R.unit=='hour'){$('#chart_title').textContent='مصرف ساعتی';   /* a window of up to 48 hours */
     drawUsage(R.days.map((x,i)=>{const d=x.key.slice(0,10),h=Number(x.key.slice(11)),now=x.key==R.now_hour;
       return {lbl:f!=t&&(h==0||i==0)?jal(d):fa(h),full:`${jalFull(d)}، ساعت ${hh(h)} تا ${hh(h+1)}`+(now?'، تا این لحظه':''),now,...x}}))}
+  else if(R.unit=='month'){$('#chart_title').textContent='مصرف ماهانه';   /* more than ~3 months: one bar per Persian month */
+    drawUsage(R.days.map((x,i)=>{const now=x.to>=CFG.today,first=i==0||jMonth(x.from)==1;
+      return {lbl:DF(first?{year:'numeric',month:'long'}:{month:'long'}).format(D(x.from)),
+        full:DF({year:'numeric',month:'long'}).format(D(x.from))+(x.part?` · ${jal(x.from)} تا ${jal(x.to)}`:'')+(now?'، تا این لحظه':''),now,...x}}))}
   else{$('#chart_title').textContent='مصرف روزانه';
     drawUsage(R.days.map(x=>({lbl:x.key==CFG.today?'امروز':jal(x.key),full:jalFull(x.key)+(x.key==CFG.today?'، تا این لحظه':''),now:x.key==CFG.today,...x})))}
 }
